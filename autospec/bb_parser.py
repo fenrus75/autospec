@@ -19,9 +19,6 @@
 
 import os
 import re
-from pprint import pprint
-
-bb_dict = {}
 
 
 def scrape_version(f):
@@ -44,11 +41,20 @@ def update_inherit(line, bb_dict):
 
 def bb_scraper(bb, specfile):
 
-    global bb_dict
-
-    print(bb)
+    bb_dict = {}
 
     bb_dict['version'] = scrape_version(bb)
 
     expr = ["??=", "?=", ":=", "+=", 
             "=+", ".=", "=.", "="]
+
+    with open(bb, 'r') as bb_fp:
+        for line in bb_fp:
+            # do not parse empty strings and comments
+            if line.strip() and not line.strip().startswith('#'):
+                line = line.strip()
+
+                if line.startswith('inherit'):
+                    update_inherit(line, bb_dict)
+
+    return bb_dict
