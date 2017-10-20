@@ -17,7 +17,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-import os
 import re
 
 
@@ -27,26 +26,73 @@ def scrape_version(f):
 
 
 def replace_pv(bb_dict):
-    for k,v in bb_dict.items():
+    for k, v in bb_dict.items():
         if "${PV}" in v:
             bb_dict[k] = v.replace("${PV}", bb_dict.get('version'))
 
 
 def update_inherit(line, bb_dict):
     if 'inherits' in bb_dict:
-       bb_dict['inherits'].append(' '.join(line.split(' ', 1)[1:]))
+        bb_dict['inherits'].append(' '.join(line.split(' ', 1)[1:]))
     else:
-       bb_dict['inherits'] = line.split(' ', 1)[1:]
+        bb_dict['inherits'] = line.split(' ', 1)[1:]
+
+
+def clean_values(value):
+    # remove beginning and end quote
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+
+    return value
+
+
+def read_in_command(line, depth, buf):
+    for c in line:
+        if c == '{':
+            depth += 1
+        if c == '}' and depth > 0:
+            depth -= 1
+        if c != "\n":
+            buf += c
+    return buf, depth
+
+
+def pattern_match_line(line):
+
+    expr = ["??=", "?=", ":=", "+=",
+            "=+", ".=", "=.", "="]
+
+    for i, e in enumerate(expr):
+        expr[i] = '\\' + '\\'.join(e)
+
+    # Split line to be [Key, expression, value] if in expr list
+    expr_pattern = r"(^[A-Z]+[_${}\[\]A-Za-z]*)\s(" + '|'.join(
+        expr) + r")\s(\".*\")"
+
+    return re.compile(expr_pattern).search(line)
+
+
+def write_to_dict(bb_dict, m):
+
+    if len(m.groups()) == 3:
+        key = m.group(1)
+        value = clean_values(m.group(3))
+        expr = m.group(2)
+
+        if key in bb_dict:
+            print("TODO: ERROR")
+
+        if expr == '=':
+            bb_dict[key] = value
+
+    return bb_dict
 
 
 def bb_scraper(bb, specfile):
 
     bb_dict = {}
-
+    todo = []
     bb_dict['version'] = scrape_version(bb)
-
-    expr = ["??=", "?=", ":=", "+=", 
-            "=+", ".=", "=.", "="]
 
     with open(bb, 'r') as bb_fp:
         for line in bb_fp:
@@ -56,5 +102,11 @@ def bb_scraper(bb, specfile):
 
                 if line.startswith('inherit'):
                     update_inherit(line, bb_dict)
+
+                match = pattern_match_line(line)
+                if match:
+                    bb_dict = write_to_dict(bb_dict, match)
+                else:
+                    todo.append(line)
 
     return bb_dict
