@@ -13,6 +13,7 @@ class TestSpecfileWrite(unittest.TestCase):
     def setUp(self):
         url = "http://www.testpkg.com/testpkg/pkg-1.0.tar.gz"
         self.specfile = specfiles.Specfile(url, '1.0', 'pkg', '2')
+        specfiles.config.config_opts['dev_requires_extras'] = False
 
         def mock_write(string):
             self.WRITES.append(string)
@@ -96,8 +97,8 @@ class TestSpecfileWrite(unittest.TestCase):
         self.specfile.requires.add("pkg2")
         self.specfile.no_autostart = True
         self.specfile.write_main_subpackage_requires()
-        expect = ["Requires: pkg-bin\n",
-                  "Requires: pkg-lib\n",
+        expect = ["Requires: pkg-bin = %{version}-%{release}\n",
+                  "Requires: pkg-lib = %{version}-%{release}\n",
                   "Requires: pkg1\n",
                   "Requires: pkg2\n"]
         self.assertEqual(expect, self.WRITES)
@@ -117,9 +118,9 @@ class TestSpecfileWrite(unittest.TestCase):
         self.specfile.requires.add("pkg1")
         self.specfile.requires.add("pkg2")
         self.specfile.write_main_subpackage_requires()
-        expect = ["Requires: pkg-autostart\n",
-                  "Requires: pkg-bin\n",
-                  "Requires: pkg-lib\n",
+        expect = ["Requires: pkg-autostart = %{version}-%{release}\n",
+                  "Requires: pkg-bin = %{version}-%{release}\n",
+                  "Requires: pkg-lib = %{version}-%{release}\n",
                   "Requires: pkg1\n",
                   "Requires: pkg2\n"]
         self.assertEqual(expect, self.WRITES)
@@ -199,8 +200,8 @@ class TestSpecfileWrite(unittest.TestCase):
                   "\n%package dev\n",
                   "Summary: dev components for the pkg package.\n",
                   "Group: Development\n",
-                  "Requires: pkg-data\n",
-                  "Provides: pkg-devel\n",
+                  "Requires: pkg-data = %{version}-%{release}\n",
+                  "Provides: pkg-devel = %{version}-%{release}\n",
                   "\n%description dev\n",
                   "dev components for the pkg package.\n",
                   "\n",
@@ -215,6 +216,29 @@ class TestSpecfileWrite(unittest.TestCase):
                   "Group: Default\n",
                   "\n%description python\n",
                   "python components for the pkg package.\n",
+                  "\n"]
+        self.assertEqual(expect, self.WRITES)
+
+    def test_write_files_header_custom_extra_requires(self):
+        """
+        test write_files_header with custom extras requires.
+        """
+        self.specfile.packages["data"] = ["file1"]
+        self.specfile.packages["test-extras"] = ["file2"]
+        self.specfile.custom_extras = { 'test-extras': { 'requires': ["data"] }}
+        self.specfile.write_files_header()
+        expect = ["\n%package data\n",
+                  "Summary: data components for the pkg package.\n",
+                  "Group: Data\n",
+                  "\n%description data\n",
+                  "data components for the pkg package.\n",
+                  "\n",
+                  "\n%package test-extras\n",
+                  "Summary: test-extras components for the pkg package.\n",
+                  "Group: Default\n",
+                  "Requires: pkg-data = %{version}-%{release}\n",
+                  "\n%description test-extras\n",
+                  "test-extras components for the pkg package.\n",
                   "\n"]
         self.assertEqual(expect, self.WRITES)
 
@@ -234,6 +258,7 @@ class TestSpecfileWrite(unittest.TestCase):
                   "python components for the Pkg package.\n",
                   "\n"]
         self.assertEqual(expect, self.WRITES)
+
 
     def test_write_files_header_bare(self):
         """

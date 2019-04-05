@@ -19,23 +19,27 @@
 # Parse config files
 #
 
+import configparser
 import os
-import sys
 import re
 import subprocess
-import test
+import sys
 import textwrap
-import configparser
 
-import tarball
+import toml
+
 import buildpattern
 import buildreq
+import check
 import license
-from util import call, write_out
+import tarball
+from util import call, print_warning, write_out
 
 extra_configure = ""
 extra_configure32 = ""
 extra_configure64 = ""
+extra_configure_avx2 = ""
+extra_configure_avx512 = ""
 config_files = set()
 parallel_build = " %{?_smp_mflags} "
 urlban = ""
@@ -45,14 +49,18 @@ extra_make_install = ""
 extra_make32_install = ""
 extra_cmake = ""
 cmake_srcdir = ""
-prep_append = []
 subdir = ""
 install_macro = "%make_install"
 disable_static = "--disable-static"
-make_install_append = []
+prep_prepend = []
+build_prepend = []
+make_prepend = []
+install_prepend = []
+install_append = []
 patches = []
 autoreconf = False
 custom_desc = ""
+set_gopath = True
 
 license_fetch = None
 license_show = None
@@ -65,14 +73,17 @@ old_keyid = None
 profile_payload = None
 signature = None
 yum_conf = None
+failed_pattern_dir = None
 
 failed_commands = {}
+ignored_commands = {}
 maven_jars = {}
 gems = {}
 license_hashes = {}
 license_translations = {}
 license_blacklist = {}
 qt_modules = {}
+cmake_modules = {}
 
 cves = []
 
@@ -114,6 +125,7 @@ config_options = {
     "verify_required": "require package verification for build",
     "security_sensitive": "set flags for security-sensitive builds",
     "so_to_lib": "add .so files to the lib package instead of dev",
+    "dev_requires_extras": "dev package requires the extras to be installed",
     "autoupdate": "this package is trusted enough to automatically update "
                   "(used by other tools)",
     "compat": "this package is a library compatability package and only "
@@ -149,17 +161,17 @@ simple_pats = [
     (r"checking for.*in -ljpeg... no", "libjpeg-turbo-dev"),
     (r"fatal error\: zlib\.h\: No such file or directory", "zlib-dev"),
     (r"\* tclsh failed", "tcl"),
-    (r"\/usr\/include\/python2\.7\/pyconfig.h", "python-dev"),
+    (r"\/usr\/include\/python3\.[0-9]+m\/pyconfig.h", "python3-dev"),
     (r"checking \"location of ncurses\.h file\"", "ncurses-dev"),
     (r"Can't exec \"aclocal\"", "automake"),
     (r"Can't exec \"aclocal\"", "libtool"),
-    (r"configure: error: no suitable Python interpreter found", "python-dev"),
-    (r"Checking for header Python.h", "python-dev"),
+    (r"configure: error: no suitable Python interpreter found", "python3-dev"),
+    (r"Checking for header Python.h", "python3-dev"),
     (r"configure: error: No curses header-files found", "ncurses-dev"),
-    (r" \/usr\/include\/python2\.6$", "python-dev"),
-    (r"to compile python extensions", "python-dev"),
+    (r" \/usr\/include\/python3\.", "python3-dev"),
+    (r"to compile python extensions", "python3-dev"),
     (r"testing autoconf... not found", "autoconf"),
-    (r"configure\: error\: could not find Python headers", "python-dev"),
+    (r"configure\: error\: could not find Python headers", "python3-dev"),
     (r"checking for libxml libraries", "libxml2-dev"),
     (r"checking for slang.h... no", "slang-dev"),
     (r"configure: error: no suitable Python interpreter found", "python3"),
@@ -176,6 +188,7 @@ simple_pats = [
 # failed_pattern patterns
 # contains patterns for parsing build.log for missing dependencies
 failed_pats = [
+    (r"Dependency (.*) found: NO", 0, None),
     (r"C library '(.*)' not found", 0, None),
     (r"Target '[a-zA-Z0-9\-]' can't be generated as '(.*)' could not be found", 0, None),
     (r"Program (.*) found: NO", 0, None),
@@ -188,7 +201,9 @@ failed_pats = [
     (r"Checking for (.*?)\s*: not found", 0, None),
     (r"configure: error: pkg-config missing (.*)", 0, None),
     (r"configure: error: Cannot find (.*)\. Make sure", 0, None),
+    (r"configure: error: (.*) not found", 0, None),
     (r"checking for (.*?)\.\.\. no", 0, None),
+    (r"Checking for (.*?)\.\.\.no", 0, None),
     (r"checking for (.*) support\.\.\. no", 0, None),
     (r"checking (.*?)\.\.\. no", 0, None),
     (r"checking for (.*)... configure: error", 0, None),
@@ -225,9 +240,10 @@ failed_pats = [
     (r"    ([a-zA-Z]+\:\:[a-zA-Z]+) not installed", 1, None),
     (r"([a-zA-Z\-]*) tool not found or not executable", 0, None),
     (r"([a-zA-Z\-]*) validation tool not found or not executable", 0, None),
-    (r"Could not find suitable distribution for Requirement.parse\('([a-zA-Z\-]*)", 0, None),
+    (r"Could not find suitable distribution for Requirement.parse\('([a-zA-Z\-\.]*)", 0, None),
     (r"unable to execute '([a-zA-Z\-]*)': No such file or directory", 0, None),
     (r"Unable to find '(.*)'", 0, None),
+    (r"Unable to `import (.*)`", 0, None),
     (r"Downloading https?://.*\.python\.org/packages/.*/.?/([A-Za-z]*)/.*", 0, None),
     (r"configure\: error\: ([a-zA-Z0-9]+) is required to build", 0, None),
     (r".* /usr/bin/([a-zA-Z0-9-_]*).*not found", 0, None),
@@ -243,6 +259,7 @@ failed_pats = [
     (r"ERROR: dependencies '([a-zA-Z0-9\-\.]*)'.* are not available for package '.*'", 0, 'R'),
     (r"ERROR: dependencies '.*', '([a-zA-Z0-9\-\.]*)',.* are not available for package '.*'", 0, 'R'),
     (r"ERROR: dependency '([a-zA-Z0-9\-\.]*)' is not available for package '.*'", 0, 'R'),
+    (r"Error: Unable to find (.*)", 0, None),
     (r"there is no package called '([a-zA-Z0-9\-\.]*)'", 0, 'R'),
     (r"you may need to install the ([a-zA-Z0-9\-:\.]*) module", 0, 'perl'),
     (r"    !  ([a-zA-Z:]+) is not installed", 0, 'perl'),
@@ -254,6 +271,7 @@ failed_pats = [
     (r"ImportError:..*: No module named ([a-zA-Z0-9\-\._]+)", 0, 'pypi'),
     (r"ImportError: No module named ([a-zA-Z0-9\-\._]+)", 0, 'pypi'),
     (r"ImportError: No module named '([a-zA-Z0-9\-\._]+)'", 0, 'pypi'),
+    (r"No local packages or working download links found for ([a-zA-Z0-9\-\._]+)", 0, 'pypi'),
     (r"Perhaps you should add the directory containing `([a-zA-Z0-9\-:]*)\.pc'", 0, 'pkgconfig'),
     (r"No package '([a-zA-Z0-9\-:]*)' found", 0, 'pkgconfig'),
     (r"Package '([a-zA-Z0-9\-:]*)', required by '.*', not found", 0, 'pkgconfig'),
@@ -280,15 +298,14 @@ failed_pats = [
      r".*:(.*):[jar|pom]+:.* has not been downloaded from it before.*", 0, 'maven'),
     (r"\[WARNING\] The POM for .*:(.*):[jar|pom]+:.* is missing, no dependency information "
      r"available", 0, 'maven'),
-    (r"^.*Could not find a package configuration file provided by \"(.*)\".*$", 0, 'catkin'),
-    (r"^.*By not providing \"Find(.*).cmake\" in CMAKE_MODULE_PATH this.*$", 0, 'catkin'),
-    (r"^.*\"(.*)\" with any of the following names.*$", 0, 'catkin')]
+    (r"^.*Could not find a package configuration file provided by \"(.*)\".*$", 0, None),
+    (r"^.*By not providing \"Find(.*).cmake\" in CMAKE_MODULE_PATH this.*$", 0, None),
+    (r"Add the installation prefix of \"(.*)\" to CMAKE_PREFIX_PATH", 0, None),
+    (r"^.*\"(.*)\" with any of the following names.*$", 0, None)]
 
 
 def get_metadata_conf():
-    """
-    gather package metadata from the tarball module
-    """
+    """Gather package metadata from the tarball module."""
     metadata = {}
     metadata['name'] = tarball.name
     if urlban:
@@ -303,9 +320,7 @@ def get_metadata_conf():
 
 
 def create_conf(path):
-    """
-    Create options.conf file. Use deprecated configuration files or defaults to populate
-    """
+    """Create options.conf file and use deprecated configuration files or defaults to populate."""
     config_f = configparser.ConfigParser(interpolation=None, allow_no_value=True)
 
     # first the metadata
@@ -328,19 +343,36 @@ def create_conf(path):
     write_config(config_f, path)
 
 
+def create_buildreq_cache(path, version):
+    """Make the buildreq_cache file."""
+    content = read_conf_file(os.path.join(path, "buildreq_cache"))
+    # don't create an empty cache file
+    if len(buildreq.buildreqs_cache) < 1:
+        try:
+            # file was possibly added to git so we should clean it up
+            os.unlink(content)
+        except Exception:
+            pass
+        return
+    if not content:
+        pkgs = sorted(buildreq.buildreqs_cache)
+    else:
+        pkgs = sorted(set(content[1:]).union(buildreq.buildreqs_cache))
+    with open(os.path.join(path, 'buildreq_cache'), "w") as cachefile:
+        cachefile.write("\n".join([version] + pkgs))
+    config_files.add('buildreq_cache')
+
+
 def write_config(config_f, path):
-    """
-    Write the config_f to configfile
-    """
+    """Write the config_f to configfile."""
     with open(os.path.join(path, 'options.conf'), 'w') as configfile:
         config_f.write(configfile)
 
 
 def read_config_opts(path):
-    """
-    Read config options from path/options.conf
-    """
+    """Read config options from path/options.conf."""
     global config_opts
+    global transforms
     opts_path = os.path.join(path, 'options.conf')
     if not os.path.exists(opts_path):
         create_conf(path)
@@ -359,11 +391,30 @@ def read_config_opts(path):
     # version of autospec or if it was user-created)
     rewrite_config_opts(path)
 
+    # Don't use the ChangeLog files if the giturl is set
+    # ChangeLog is just extra noise when we can already see the gitlog
+    if "package" in config_f.sections() and config_f['package'].get('giturl'):
+        keys = []
+        for k, v in transforms.items():
+            if v == "ChangeLog":
+                keys.append(k)
+        for k in keys:
+            transforms.pop(k)
+
+
+def read_extras_config(path):
+    """Return parsed extras configurations from path."""
+    if not os.path.exists(path):
+        return None
+    try:
+        return toml.load(path)
+    except Exception as excpt:
+        print_warning(excpt)
+    return None
+
 
 def rewrite_config_opts(path):
-    """
-    Rewrite options.conf file when an option has changed (verify_required for example)
-    """
+    """Rewrite options.conf file when an option has changed (verify_required for example)."""
     config_f = configparser.ConfigParser(interpolation=None, allow_no_value=True)
     config_f['package'] = get_metadata_conf()
     config_f['autospec'] = {}
@@ -382,16 +433,12 @@ def rewrite_config_opts(path):
 
 
 def filter_blanks(lines):
-    """
-    Filter out blank lines from the line list
-    """
+    """Filter out blank lines from the line list."""
     return [l.strip() for l in lines if not l.strip().startswith("#") and l.split()]
 
 
 def read_conf_file(path):
-    """
-    read configuration file at path
-    """
+    """Read configuration file at path."""
     try:
         with open(path, "r") as f:
             config_files.add(os.path.basename(path))
@@ -400,51 +447,61 @@ def read_conf_file(path):
         return []
 
 
-def read_pattern_conf(filename, dest, list_format=False):
+def read_pattern_conf(filename, dest, list_format=False, path=None):
+    """Read a fail-pattern configuration file.
+
+    Read fail-pattern config file in the form of <pattern>, <package> and ignore lines starting with '#.'
     """
-    Read a fail-pattern configuration file in the form of
-    <pattern>, <package> and ignore lines starting with "#"
-    """
-    file_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(file_dir, filename)
-    with open(file_path, "r") as patfile:
-        for line in patfile:
-            if line.startswith("#"):
-                continue
-            # Make list format a dict for faster lookup times
-            if list_format:
-                dest[line.strip()] = True
-                continue
-            # split from the right a maximum of one time, since the pattern
-            # string might contain ", "
-            pattern, package = line.rsplit(", ", 1)
-            dest[pattern] = package.rstrip()
+    file_repo_dir = os.path.dirname(os.path.abspath(__file__))
+    file_conf_path = os.path.join(path, filename) if path else None
+    file_repo_path = os.path.join(file_repo_dir, filename)
+    if not os.path.isfile(file_repo_path):
+        return
+    if file_conf_path and os.path.isfile(file_conf_path):
+        # The file_conf_path version of a pattern will be used in case of conflict
+        file_path = [file_repo_path, file_conf_path]
+    else:
+        file_path = [file_repo_path]
+    for fpath in file_path:
+        with open(fpath, "r") as patfile:
+            for line in patfile:
+                if line.startswith("#"):
+                    continue
+                # Make list format a dict for faster lookup times
+                if list_format:
+                    dest[line.strip()] = True
+                    continue
+                # split from the right a maximum of one time, since the pattern
+                # string might contain ", "
+                pattern, package = line.rsplit(", ", 1)
+                dest[pattern] = package.rstrip()
 
 
-def setup_patterns():
-    """
-    Read each pattern configuration file and assign to the appropriate variable
-    """
+def setup_patterns(path=None):
+    """Read each pattern configuration file and assign to the appropriate variable."""
     global failed_commands
+    global ignored_commands
     global maven_jars
     global gems
     global license_hashes
     global license_translations
     global license_blacklist
     global qt_modules
-    read_pattern_conf("failed_commands", failed_commands)
-    read_pattern_conf("maven_jars", maven_jars)
-    read_pattern_conf("gems", gems)
-    read_pattern_conf("license_hashes", license_hashes)
-    read_pattern_conf("license_translations", license_translations)
-    read_pattern_conf("license_blacklist", license_blacklist, list_format=True)
-    read_pattern_conf("qt_modules", qt_modules)
+    global cmake_modules
+
+    read_pattern_conf("ignored_commands", ignored_commands, list_format=True, path=path)
+    read_pattern_conf("failed_commands", failed_commands, path=path)
+    read_pattern_conf("maven_jars", maven_jars, path=path)
+    read_pattern_conf("gems", gems, path=path)
+    read_pattern_conf("license_hashes", license_hashes, path=path)
+    read_pattern_conf("license_translations", license_translations, path=path)
+    read_pattern_conf("license_blacklist", license_blacklist, list_format=True, path=path)
+    read_pattern_conf("qt_modules", qt_modules, path=path)
+    read_pattern_conf("cmake_modules", cmake_modules, path=path)
 
 
 def parse_existing_spec(path, name):
-    """
-    Determine the old version, old patch list, old keyid, and cves from old spec file
-    """
+    """Determine the old version, old patch list, old keyid, and cves from old spec file."""
     global old_version
     global old_patches
     global old_keyid
@@ -477,13 +534,13 @@ def parse_existing_spec(path, name):
             cves.append(patch.upper().split(".PATCH")[0])
 
 
-def parse_config_files(path, bump, filemanager):
-    """
-    Parse the various configuration files that may exist in the package directory
-    """
+def parse_config_files(path, bump, filemanager, version):
+    """Parse the various configuration files that may exist in the package directory."""
     global extra_configure
     global extra_configure32
     global extra_configure64
+    global extra_configure_avx2
+    global extra_configure_avx512
     global config_files
     global parallel_build
     global license_fetch
@@ -500,15 +557,20 @@ def parse_config_files(path, bump, filemanager):
     global extra_make32_install
     global extra_cmake
     global cmake_srcdir
-    global prep_append
     global subdir
     global install_macro
     global disable_static
-    global make_install_append
+    global prep_prepend
+    global build_prepend
+    global make_prepend
+    global install_prepend
+    global install_append
     global patches
     global autoreconf
+    global set_gopath
     global yum_conf
     global custom_desc
+    global failed_pattern_dir
 
     packages_file = None
 
@@ -526,12 +588,15 @@ def parse_config_files(path, bump, filemanager):
         license_show = config['autospec'].get('license_show', None)
         packages_file = config['autospec'].get('packages_file', None)
         yum_conf = config['autospec'].get('yum_conf', None)
+        failed_pattern_dir = config['autospec'].get('failed_pattern_dir', None)
 
         # support reading the local files relative to config_file
         if packages_file and not os.path.isabs(packages_file):
             packages_file = os.path.join(os.path.dirname(config_file), packages_file)
         if yum_conf and not os.path.isabs(yum_conf):
             yum_conf = os.path.join(os.path.dirname(config_file), yum_conf)
+        if failed_pattern_dir and not os.path.isabs(failed_pattern_dir):
+            failed_pattern_dir = os.path.join(os.path.dirname(config_file), failed_pattern_dir)
 
         if not packages_file:
             print("Warning: Set [autospec][packages_file] path to package list file for "
@@ -563,9 +628,7 @@ def parse_config_files(path, bump, filemanager):
     wrapper.subsequent_indent = "# "
 
     def write_default_conf_file(name, description):
-        """
-        Write default configuration file with description to file name
-        """
+        """Write default configuration file with description to file name."""
         config_files.add(name)
         filename = os.path.join(path, name)
         if os.path.isfile(filename):
@@ -624,6 +687,12 @@ def parse_config_files(path, bump, filemanager):
         print("Adding additional build requirement: %s." % extra)
         buildreq.add_buildreq(extra)
 
+    content = read_conf_file(os.path.join(path, "buildreq_cache"))
+    if content and content[0] == version:
+        for extra in content[1:]:
+            print("Adding additional build (cache) requirement: %s." % extra)
+            buildreq.add_buildreq(extra)
+
     content = read_conf_file(os.path.join(path, "pkgconfig_add"))
     for extra in content:
         extra = "pkgconfig(%s)" % extra
@@ -642,12 +711,35 @@ def parse_config_files(path, bump, filemanager):
 
     content = read_conf_file(os.path.join(path, "extras"))
     for extra in content:
-        print("extras for: %s." % extra)
+        print("extras for  : %s." % extra)
     filemanager.extras += content
+
+    for fname in os.listdir(path):
+        if not re.search('.+_extras$', fname) or fname == "dev_extras":
+            continue
+        content = read_extras_config(os.path.join(path, fname))
+        if not content:
+            print_warning(f"Error reading custom extras file: {fname}")
+            continue
+        name = fname[:-len("_extras")]
+        if "files" not in content or type(content['files']) is not list:
+            print_warning(f"Invalid custom extras file: {fname} invalid or missing files list")
+            continue
+        if "requires" in content:
+            if type(content['requires']) is not list:
+                print_warning(f"Invalid custom extras file: {fname} invalid requires list")
+                continue
+        print(f"{name}-extras for {content['files']}")
+        filemanager.custom_extras[f"{name}-extras"] = content
+
+    content = read_conf_file(os.path.join(path, "dev_extras"))
+    for extra in content:
+        print("dev for     : %s." % extra)
+    filemanager.dev_extras += content
 
     content = read_conf_file(os.path.join(path, "setuid"))
     for suid in content:
-        print("setuid for: %s." % suid)
+        print("setuid for  : %s." % suid)
     filemanager.setuid += content
 
     content = read_conf_file(os.path.join(path, "attrs"))
@@ -660,8 +752,7 @@ def parse_config_files(path, bump, filemanager):
 
     patches += read_conf_file(os.path.join(path, "series"))
     pfiles = [("%s/%s" % (path, x.split(" ")[0])) for x in patches]
-    cmd = "egrep \"(\+\+\+|\-\-\-).*((Makefile.am)|(configure.ac|configure.in))\" %s" % \
-        " ".join(pfiles)
+    cmd = "egrep \"(\+\+\+|\-\-\-).*((Makefile.am)|(configure.ac|configure.in))\" %s" % " ".join(pfiles)  # noqa: W605
     if patches and call(cmd,
                         check=False,
                         stdout=subprocess.DEVNULL,
@@ -681,33 +772,40 @@ def parse_config_files(path, bump, filemanager):
     content = read_conf_file(os.path.join(path, "configure64"))
     extra_configure64 = " \\\n".join(content)
 
+    content = read_conf_file(os.path.join(path, "configure_avx2"))
+    extra_configure_avx2 = " \\\n".join(content)
+
+    content = read_conf_file(os.path.join(path, "configure_avx512"))
+    extra_configure_avx512 = " \\\n".join(content)
+
     if config_opts["keepstatic"]:
         disable_static = ""
     if config_opts['broken_parallel_build']:
         parallel_build = ""
 
     content = read_conf_file(os.path.join(path, "make_args"))
-    if content and content[0]:
-        extra_make = content[0]
+    if content:
+        extra_make = " \\\n".join(content)
 
     content = read_conf_file(os.path.join(path, "make32_args"))
-    if content and content[0]:
-        extra32_make = content[0]
+    if content:
+        extra32_make = " \\\n".join(content)
 
     content = read_conf_file(os.path.join(path, "make_install_args"))
-    if content and content[0]:
-        extra_make_install = content[0]
+    if content:
+        extra_make_install = " \\\n".join(content)
 
     content = read_conf_file(os.path.join(path, "make32_install_args"))
-    if content and content[0]:
-        extra_make32_install = content[0]
+    if content:
+        extra_make32_install = " \\\n".join(content)
 
     content = read_conf_file(os.path.join(path, "install_macro"))
     if content and content[0]:
         install_macro = content[0]
 
     content = read_conf_file(os.path.join(path, "cmake_args"))
-    extra_cmake = "\\\n".join(content)
+    if content:
+        extra_cmake = " \\\n".join(content)
 
     content = read_conf_file(os.path.join(path, "cmake_srcdir"))
     if content and content[0]:
@@ -723,8 +821,8 @@ def parse_config_files(path, bump, filemanager):
         autoreconf = False
 
     content = read_conf_file(os.path.join(path, "make_check_command"))
-    if content and content[0]:
-        test.tests_config = content[0]
+    if content:
+        check.tests_config = '\n'.join(content)
 
     content = read_conf_file(os.path.join(path, tarball.name + ".license"))
     if content and content[0]:
@@ -740,7 +838,7 @@ def parse_config_files(path, bump, filemanager):
 
     if config_opts['use_clang']:
         config_opts['funroll-loops'] = False
-        buildreq.add_buildreq("llvm-dev")
+        buildreq.add_buildreq("llvm")
 
     if config_opts['32bit']:
         buildreq.add_buildreq("glibc-libc32")
@@ -749,8 +847,15 @@ def parse_config_files(path, bump, filemanager):
         buildreq.add_buildreq("gcc-libgcc32")
         buildreq.add_buildreq("gcc-libstdc++32")
 
-    make_install_append = read_conf_file(os.path.join(path, "make_install_append"))
-    prep_append = read_conf_file(os.path.join(path, "prep_append"))
+    prep_prepend = read_conf_file(os.path.join(path, "prep_prepend"))
+    if os.path.isfile(os.path.join(path, "prep_append")):
+        os.rename(os.path.join(path, "prep_append"), os.path.join(path, "build_prepend"))
+    make_prepend = read_conf_file(os.path.join(path, "make_prepend"))
+    build_prepend = read_conf_file(os.path.join(path, "build_prepend"))
+    install_prepend = read_conf_file(os.path.join(path, "install_prepend"))
+    if os.path.isfile(os.path.join(path, "make_install_append")):
+        os.rename(os.path.join(path, "make_install_append"), os.path.join(path, "install_append"))
+    install_append = read_conf_file(os.path.join(path, "install_append"))
 
     profile_payload = read_conf_file(os.path.join(path, "profile_payload"))
 
@@ -758,9 +863,7 @@ def parse_config_files(path, bump, filemanager):
 
 
 def load_specfile(specfile):
-    """
-    Load specfile object with configuration
-    """
+    """Load specfile object with configuration."""
     specfile.urlban = urlban
     specfile.keepstatic = config_opts['keepstatic']
     specfile.no_autostart = config_opts['no_autostart']
@@ -770,10 +873,14 @@ def load_specfile(specfile):
     specfile.extra_make32_install = extra_make32_install
     specfile.extra_cmake = extra_cmake
     specfile.cmake_srcdir = cmake_srcdir or specfile.cmake_srcdir
-    specfile.prep_append = prep_append
     specfile.subdir = subdir
     specfile.install_macro = install_macro
     specfile.disable_static = disable_static
-    specfile.make_install_append = make_install_append
+    specfile.prep_prepend = prep_prepend
+    specfile.build_prepend = build_prepend
+    specfile.make_prepend = make_prepend
+    specfile.install_prepend = install_prepend
+    specfile.install_append = install_append
     specfile.patches = patches
     specfile.autoreconf = autoreconf
+    specfile.set_gopath = set_gopath

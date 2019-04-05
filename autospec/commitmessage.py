@@ -22,25 +22,24 @@
 #
 #
 
-import re
 import os
+import re
 import shutil
 import sys
+from subprocess import PIPE, run
 
 import build
 import config
 import tarball
 import util
 
-from subprocess import PIPE, run
-
 
 def scan_for_changes(download_path, directory):
-    """
-    scan_for_changes(download_path, directory) scans for changelogs or news
-    files in the source code and copies them to download_path as their
-    `config.transform`ed name. The file with the transformed name will later be
-    parsed to find the commit message.
+    """Scan for changelogs or news files in the file sources.
+
+    Scan for changelogs or news files in the source code and copy them to download_path as their
+    `config.transform`ed name. The file with the transformed name will later be parsed to find the
+    commit message.
     """
     found = []
     interests = config.transforms.keys()
@@ -51,17 +50,19 @@ def scan_for_changes(download_path, directory):
             target = os.path.join(download_path, config.transforms[item.lower()])
             try:
                 shutil.copy(source, target)
+                os.chmod(target, 0o644)
             except Exception as e:
-                print("Error copying file: %s", e)
+                print("Error copying file: {}".format(e))
                 sys.exit(1)
             found.append(item)
 
 
 def is_header(lines, curindex):
-    """
-    is_header(lines, curindex) checks if the current line is a section header
-    by checking for a blank line before it or an underline/section break (---)
-    after it. Returns True for lines at the beginning or end of the file
+    """Check if the current line is a section header.
+
+    Check if the current line is a section header by looking for a blank line before it or an
+    underline/section break (---) after it. Returns True for lines at the beginning or end of the
+    file.
     """
     if curindex == 0:
         # treat the start of the file as a header
@@ -77,18 +78,15 @@ def is_header(lines, curindex):
 
 
 def find_in_line(pattern, line):
-    """
-    find_in_line(line, pattern) returns True if the pattern is in the line,
-    False otherwise
-    """
+    """Return True if the pattern is in the line, False otherwise."""
     return bool(re.search(pattern, line))
 
 
 def process_NEWS(newsfile):
-    """
-    process_NEWS(newsfile) parses the newsfile for changes and CVE fixes
-    relevant to current version update. This information is returned as a
-    tuple: (commitmessage, cves)
+    """Parse the newfile for relevent changes.
+
+    Look for changes and CVE fixes relevant to current version update. This information is returned
+    as a tuple: (commitmessage, cves).
 
     A maximum of 15 lines from the newsfile is returned in the commitmessage.
     If the newsfile information is truncated to 15 lines an additional line is
@@ -150,12 +148,12 @@ def process_NEWS(newsfile):
         return commitmessage, cves
 
     # now search for CVEs
-    pat = re.compile("(CVE\-[0-9]+\-[0-9]+)")
+    pat = re.compile(r"(CVE\-[0-9]+\-[0-9]+)")
     for news in newslines[start:stop]:
         match = pat.search(news)
         if match:
-                s = match.group(1)
-                cves.add(s)
+            s = match.group(1)
+            cves.add(s)
 
     # compile commitmessage to return
     commitmessage.append("")
@@ -171,11 +169,7 @@ def process_NEWS(newsfile):
 
 
 def process_git(giturl, oldversion, newversion):
-    """
-    process_git() checks out a git tree and tries to turn the
-    git history into a commit message
-    """
-
+    """Check out a git tree and try to turn the git history into a commit message."""
     oldtag = ""
     guessed_oldtag = oldversion
     newtag = ""
@@ -207,9 +201,11 @@ def process_git(giturl, oldversion, newversion):
     if newtag == "":
         newtag = guessed_newtag
 
-    p = run(["git", "-C", "results/" + tarball.name, "log", oldtag + ".." + newtag], stdout=PIPE)
+    p = run(["git", "-C", "results/" + tarball.name, "log", "--no-merges", oldtag + ".." + newtag], stdout=PIPE)
     fulllog = p.stdout.decode('utf-8').split('\n')
-    p = run(["git", "-C", "results/" + tarball.name, "shortlog", oldtag + ".." + newtag], stdout=PIPE)
+    # 'git shortlog' can accept any 'git log' output over stdin, so make sure
+    # it lacks merge commits, too.
+    p = run(["git", "-C", "results/" + tarball.name, "shortlog"], input=p.stdout, stdout=PIPE)
     shortlog = p.stdout.decode('utf-8').split('\n')
 
     if len(fulllog) < 15:
@@ -219,10 +215,10 @@ def process_git(giturl, oldversion, newversion):
 
 
 def guess_commit_message(keyinfo):
-    """
-    guess_commit_message() parses newsfiles and determines a sane commit
-    message. The commit message defaults to the following for an updated
-    version if no CVEs are fixed:
+    """Parse newsfile for a commit message.
+
+    Try and find a sane commit message for the newsfile. The commit message defaults to the
+    following for an updated version if no CVEs are fixed:
 
     <tarball name>: Autospec creation for update from version <old> to version <new>
 
@@ -262,7 +258,13 @@ def guess_commit_message(keyinfo):
                                  .format(tarball.name, tarball.version))
     commitmessage.append("")
 
-    for newsfile in ["NEWS", "ChangeLog"]:
+    # Only use Changelog if the giturl isn't defined as it is often
+    # duplicate content from the git log.
+    if tarball.giturl:
+        newsfiles = ["NEWS"]
+    else:
+        newsfiles = ["NEWS", "ChangeLog"]
+    for newsfile in newsfiles:
         # parse news files for relevant version updates and cve fixes
         newcommitmessage, newcves = process_NEWS(newsfile)
         commitmessage.extend(newcommitmessage)
@@ -286,5 +288,5 @@ def guess_commit_message(keyinfo):
     print("Guessed commit message:")
     try:
         print("\n".join(commitmessage))
-    except:
+    except Exception:
         print("Can't print")

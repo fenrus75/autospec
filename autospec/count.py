@@ -15,8 +15,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-import re
+
 import argparse
+import re
 
 testcount = {}
 testpass = {}
@@ -41,6 +42,7 @@ name = ''
 
 
 def zero_test_data():
+    """Zero test results."""
     global total_tests
     global total_pass
     global total_fail
@@ -64,6 +66,7 @@ def zero_test_data():
 
 
 def sanitize_counts():
+    """Validate test counts are within sane bounds."""
     global total_tests
     global total_pass
     global total_fail
@@ -94,6 +97,7 @@ def sanitize_counts():
 
 
 def collect_output():
+    """Sum test results."""
     if not testcount.get(name):
         testcount[name] = 0 if not testcount.get(name) else testcount[name]
     if not testpass.get(name):
@@ -123,13 +127,35 @@ def collect_output():
 
 
 def convert_int(intstr):
+    """Integer conversion wrapper."""
     try:
         return int(intstr)
     except ValueError:
         return 0
 
 
+def parse_meson_test(lines):
+    """Parse outout of meson tests logs."""
+    global total_pass
+    global total_fail
+    global total_skip
+    for line in lines:
+        line = line.rstrip().split()
+        if len(line) != 2:
+            continue
+        if line[0] == 'OK:':
+            total_pass = convert_int(line[1])
+        elif line[0] == 'FAIL:':
+            total_fail = convert_int(line[1])
+        elif line[0] == 'SKIP:':
+            total_skip = convert_int(line[1])
+        elif line[0] == 'TIMEOUT:':
+            # Count timeouts as failures.
+            total_fail = convert_int(line[1])
+
+
 def parse_log(log, pkgname=''):
+    """Parse output of test logs."""
     global total_tests
     global total_pass
     global total_fail
@@ -151,7 +177,7 @@ def parse_log(log, pkgname=''):
                   "+ make check",
                   "##### Testing packages."]
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         line = line.rstrip()
 
         for zline in zero_lines:
@@ -160,6 +186,11 @@ def parse_log(log, pkgname=''):
                     zero_test_data()
                 else:
                     incheck = True
+
+        if "/usr/bin/meson test" in line:
+            zero_test_data()
+            parse_meson_test(lines[idx:])
+            break
 
         match = re.search(r"CLR-XTEST: Package: (.*)", line)
         if match:
@@ -330,6 +361,16 @@ def parse_log(log, pkgname=''):
             total_fail += convert_int(match.group(1))
             total_pass += convert_int(match.group(2))
             total_skip += convert_int(match.group(3))
+            continue
+
+        # mercurial
+        # running 59 tests using 8 parallel processes
+        # # Ran 55 tests, 4 skipped, 0 failed.
+        match = re.search(r"^# Ran ([0-9]+) tests\, ([0-9]+) skipped\, ([0-9]+) failed.", line)
+        if match and incheck:
+            total_fail += convert_int(match.group(3))
+            total_skip += convert_int(match.group(2))
+            total_pass += (convert_int(match.group(1)) - convert_int(match.group(2)) - convert_int(match.group(3)))
             continue
 
         # swift
@@ -1225,12 +1266,12 @@ def parse_log(log, pkgname=''):
         # == 55 tests, 48 stderr failures, 6 stdout failures, 0 stderrB failures, 0 stdoutB failures, 0 post failures ==
         # == 125 tests, 12 stderr failures, 0 stdout failures, 0 stderrB failures, 0 stdoutB failures, 0 post failures ==
         match = re.search(r"\=\= ([0-9]+) tests?\, ([0-9]+) stderr failures?\, ([0-9]+) stdout failures?\, "
-                          "([0-9]+) stderrB failures?\, ([0-9]+) stdoutB failures?\, ([0-9]+) post failures? \=\=", line)
+                          r"([0-9]+) stderrB failures?\, ([0-9]+) stdoutB failures?\, ([0-9]+) post failures? \=\=", line)
         if match and incheck:
             total_tests += convert_int(match.group(1))
             total_fail += (convert_int(match.group(2)) + convert_int(match.group(3)) + convert_int(match.group(4)) + convert_int(match.group(5)) + convert_int(match.group(6)))
-            total_pass += (convert_int(match.group(1)) - (convert_int(match.group(2)) + convert_int(match.group(3)) + convert_int(match.group(4)) + convert_int(match.group(5)) +
-                                                          convert_int(match.group(6))))
+            total_pass += \
+                (convert_int(match.group(1)) - (convert_int(match.group(2)) + convert_int(match.group(3)) + convert_int(match.group(4)) + convert_int(match.group(5)) + convert_int(match.group(6))))
             continue
 
         # zsh
@@ -1322,6 +1363,7 @@ def parse_log(log, pkgname=''):
 
 
 def string_out():
+    """Output test result counts."""
     retstr = ""
     for key in sorted(testcount):
         # key may be an empty string, which is fine since this is handled by

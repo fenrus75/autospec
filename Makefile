@@ -1,5 +1,8 @@
 check: autospec/*.py
-	@flake8 --max-line-length=199 --ignore=E722 $^
+	@flake8 --ignore=D100,I201 $^
+
+test_download:
+	PYTHONPATH=${CURDIR}/autospec python3 tests/test_download.py
 
 test_pkg_integrity:
 	PYTHONPATH=${CURDIR}/autospec python3 tests/test_pkg_integrity.py
@@ -37,8 +40,8 @@ test_specdescription:
 test_count:
 	PYTHONPATH=${CURDIR}/autospec python3 tests/test_count.py
 
-test_test:
-	PYTHONPATH=${CURDIR}/autospec python3 tests/test_test.py
+test_check:
+	PYTHONPATH=${CURDIR}/autospec python3 tests/test_check.py
 
 test_util:
 	PYTHONPATH=${CURDIR}/autospec python3 tests/test_util.py

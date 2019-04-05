@@ -25,6 +25,7 @@ class TestBuildreq(unittest.TestCase):
         buildreq.verbose = False
         buildreq.cargo_bin = False
         buildreq.config.config_opts['32bit'] = False
+        buildreq.config.cmake_modules = {}
         buildreq.config.os_packages = set()
         buildreq.buildpattern.pattern_strength = 0
 
@@ -177,7 +178,7 @@ class TestBuildreq(unittest.TestCase):
         buildreq.toml.loads = loads_backup
 
         self.assertEqual(buildreq.buildreqs,
-                         set(['cargo', 'rustc', 'dep1', 'dep2', 'dep3']))
+                         set(['rustc', 'dep1', 'dep2', 'dep3']))
         self.assertTrue(buildreq.cargo_bin)
         self.assertEqual(buildreq.buildpattern.default_pattern, 'cargo')
 
@@ -228,6 +229,8 @@ class TestBuildreq(unittest.TestCase):
         Test clean_python_req with a common python requirements string
         """
         self.assertEqual(buildreq.clean_python_req('requirement >= 1.1.2'),
+                         'requirement')
+        self.assertEqual(buildreq.clean_python_req('requirement ; python_version > 1.1.2'),
                          'requirement')
 
     def test_clean_python_req_comment(self):
@@ -424,14 +427,97 @@ class TestBuildreq(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpd:
             os.mkdir(os.path.join(tmpd, 'subdir'))
             open(os.path.join(tmpd, 'subdir', 'test.go'), 'w').close()
+            open(os.path.join(tmpd, 'setup.py'), 'w').close()
             open(os.path.join(tmpd, 'CMakeLists.txt'), 'w').close()
             open(os.path.join(tmpd, 'SConstruct'), 'w').close()
+            open(os.path.join(tmpd, 'meson.build'), 'w').close()
 
             buildreq.scan_for_configure(tmpd)
 
         self.assertEqual(buildreq.buildreqs,
-                         set(['go', 'cmake', 'scons', 'python-dev']))
+                         set(['buildreq-golang', 'buildreq-cmake', 'buildreq-scons', 'buildreq-distutils3', 'buildreq-meson']))
 
+    def test_parse_cmake_pkg_check_modules(self):
+        """
+        Test parse_cmake to ensure accurate detection of versioned and
+        unversioned pkgconfig modules.
+        """
+        content = 'pkg_check_modules(GLIB gio-unix-2.0>=2.46.0 glib-2.0 REQUIRED)'
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, 'fname'), 'w') as f:
+                f.write(content)
+            buildreq.parse_cmake(os.path.join(tmpd, 'fname'))
+
+        self.assertEqual(buildreq.buildreqs,
+                         set(['pkgconfig(gio-unix-2.0)', 'pkgconfig(glib-2.0)']))
+
+    def test_parse_cmake_pkg_check_modules_whitespace(self):
+        """
+        Test parse_cmake to ensure accurate handling of versioned
+        pkgconfig modules with whitespace.
+        """
+        content = 'pkg_check_modules(GLIB gio-unix-2.0 >= 2.46.0 glib-2.0 REQUIRED)'
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, 'fname'), 'w') as f:
+                f.write(content)
+            buildreq.parse_cmake(os.path.join(tmpd, 'fname'))
+
+        self.assertEqual(buildreq.buildreqs,
+                         set(['pkgconfig(gio-unix-2.0)', 'pkgconfig(glib-2.0)']))
+
+    def test_parse_cmake_pkg_check_modules_in_a_comment(self):
+        """
+        Test parse_cmake to ensure it ignores pkg_check_modules in comments.
+        """
+        content = '''
+# For example, consider the following patch to some CMakeLists.txt.
+#     - pkg_check_modules(FOO REQUIRED foo>=1.0)
+#     + pkg_check_modules(FOO REQUIRED foo>=2.0)
+'''
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, 'fname'), 'w') as f:
+                f.write(content)
+            buildreq.parse_cmake(os.path.join(tmpd, 'fname'))
+
+        self.assertEqual(buildreq.buildreqs,
+                         set([]))
+
+    def test_parse_cmake_pkg_check_modules_variables(self):
+        """
+        Test parse_cmake to ensure accurate handling of versioned
+        pkgconfig modules with variable version strings.
+        """
+        content = 'pkg_check_modules(AVCODEC libavcodec${_avcodec_ver} libavutil$_avutil_ver)'
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, 'fname'), 'w') as f:
+                f.write(content)
+            buildreq.parse_cmake(os.path.join(tmpd, 'fname'))
+
+        self.assertEqual(buildreq.buildreqs,
+                         set(['pkgconfig(libavcodec)', 'pkgconfig(libavutil)']))
+
+    def test_parse_cmake_find_package(self):
+        """
+        Test parse_cmake to ensure accurate handling of find_package.
+        """
+        buildreq.config.cmake_modules = {
+            "valid": "valid",
+            "valid_but_commented": "valid_but_commented",
+            "different_name": "another_name",
+        }
+        content = '''
+find_package(valid)
+#find_package(foo)
+  # find_package(valid_but_commented)
+find_package(different_name)
+'''
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, 'fname'), 'w') as f:
+                f.write(content)
+            buildreq.parse_cmake(os.path.join(tmpd, 'fname'))
+
+        self.assertEqual(buildreq.buildreqs,
+                         set(['valid', 'another_name']))
 
 if __name__ == '__main__':
     unittest.main(buffer=True)

@@ -236,6 +236,82 @@ class TestBuildpattern(unittest.TestCase):
         self.assertIn('jdk-apache-parent', build.buildreq.buildreqs)
         self.assertEqual(build.must_restart, 1)
 
+    def test_parse_buildroot_log_fail(self):
+        """
+        Test parse_buildroot_log with a test log indicating failure due to
+        missing dependencies ('foobar' and 'foobarbaz')
+        """
+        def mock_util_call(cmd):
+            del cmd
+
+        build.config.setup_patterns()
+        build.config.config_opts['32bit'] = True
+        call_backup = build.util.call
+        build.util.call = mock_util_call
+
+        open_name = 'build.open'
+        content = "line1\nDEBUG util.py:399:  No matching package to install: 'foobar'\nDEBUG util.py:399:  No matching package to install: 'foobarbaz'\nline 4"
+        m_open = mock_open(read_data=content)
+
+        result = True
+        with patch(open_name, m_open, create=True):
+            result = build.parse_buildroot_log('testname', 1)
+
+        build.util.call = call_backup
+
+        self.assertFalse(result)
+        self.assertEqual(build.must_restart, 0)
+
+    def test_parse_buildroot_log_pass(self):
+        """
+        Test parse_buildroot_log with a test log indicating no failures
+        """
+        def mock_util_call(cmd):
+            del cmd
+
+        build.config.setup_patterns()
+        build.config.config_opts['32bit'] = True
+        call_backup = build.util.call
+        build.util.call = mock_util_call
+
+        open_name = 'build.open'
+        content = "line 1\nline 2\nline 3\nline 4"
+        m_open = mock_open(read_data=content)
+
+        result = True
+        with patch(open_name, m_open, create=True):
+            result = build.parse_buildroot_log('testname', 1)
+
+        build.util.call = call_backup
+
+        self.assertTrue(result)
+        self.assertEqual(build.must_restart, 0)
+
+    def test_parse_buildroot_log_noop(self):
+        """
+        Test parse_buildroot_log when parsing should be skipped (i.e. mock
+        returned 0)
+        """
+        def mock_util_call(cmd):
+            del cmd
+
+        build.config.setup_patterns()
+        build.config.config_opts['32bit'] = True
+        call_backup = build.util.call
+        build.util.call = mock_util_call
+
+        open_name = 'build.open'
+        content = "line 1\nline 2\nline 3\nline 4"
+        m_open = mock_open(read_data=content)
+
+        result = True
+        with patch(open_name, m_open, create=True):
+            result = build.parse_buildroot_log('testname', 0)
+
+        build.util.call = call_backup
+
+        self.assertTrue(result)
+
     def test_parse_build_results_pkgconfig(self):
         """
         Test parse_build_results with a test log indicating failure due to a

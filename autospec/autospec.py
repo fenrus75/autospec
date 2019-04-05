@@ -17,41 +17,37 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import argparse
-import sys
-import os
-import shutil
-import re
-import tempfile
 import configparser
+import os
+import re
+import sys
+import tempfile
 
+from abireport import examine_abi
 import build
 import buildpattern
 import buildreq
+import check
+import commitmessage
 import config
 import files
 import git
-import license
-import specdescription
-import tarball
-import test
-import commitmessage
-import pkg_integrity
-import specfiles
-import pkg_scan
 import infile_handler
 import infile_update_spec
-
-from util import print_fatal, binary_in_path, write_out, print_infile
-from abireport import examine_abi
+import license
 from logcheck import logcheck
+import pkg_integrity
+import pkg_scan
+import specdescription
+import specfiles
+import tarball
+from util import binary_in_path, print_fatal, print_infile, write_out
 
 sys.path.append(os.path.dirname(__file__))
 
 
 def add_sources(download_path, archives):
-    """
-    Add archives to buildpattern sources and archive_details
-    """
+    """Add archives to buildpattern sources and archive_details."""
     for srcf in os.listdir(download_path):
         if re.search(r".*\.(mount|service|socket|target|timer|path)$", srcf):
             buildpattern.sources["unit"].append(srcf)
@@ -63,19 +59,20 @@ def add_sources(download_path, archives):
     # directories which usually reside in directories such as
     # /run or /tmp.
     #
-    if os.path.exists(os.path.normpath(build.download_path +
-                                       "/{0}.tmpfiles".format(tarball.name))):
+    if os.path.exists(os.path.normpath(
+            build.download_path + "/{0}.tmpfiles".format(tarball.name))):
         buildpattern.sources["tmpfile"].append(
             "{}.tmpfiles".format(tarball.name))
     if tarball.gcov_file:
         buildpattern.sources["gcov"].append(tarball.gcov_file)
+    buildpattern.sources["archive"] = archives[::2]
+    buildpattern.sources["destination"] = archives[1::2]
     for archive, destination in zip(archives[::2], archives[1::2]):
-        buildpattern.sources["archive"].append(archive)
         buildpattern.archive_details[archive + "destination"] = destination
 
 
 def check_requirements(use_git):
-    """ Ensure all requirements are satisfied before continuing """
+    """Ensure all requirements are satisfied before continuing."""
     required_bins = ["mock", "rpm2cpio", "nm", "objdump", "cpio", "readelf"]
 
     if use_git:
@@ -89,19 +86,18 @@ def check_requirements(use_git):
 
 
 def load_specfile(specfile):
-    """
-    Gather all information from static analysis into Specfile instance
-    """
+    """Gather all information from static analysis into Specfile instance."""
     config.load_specfile(specfile)
     tarball.load_specfile(specfile)
     specdescription.load_specfile(specfile)
     license.load_specfile(specfile)
     buildreq.load_specfile(specfile)
     buildpattern.load_specfile(specfile)
-    test.load_specfile(specfile)
+    check.load_specfile(specfile)
 
 
 def read_old_metadata():
+    """Handle options.conf providing package, url and archives."""
     if not os.path.exists(os.path.join(os.getcwd(), 'options.conf')):
         return None, None, []
 
@@ -119,21 +115,18 @@ def read_old_metadata():
             archives)
 
 
-def save_build_log(path, iteration):
-    """
-    Save build log to <path>/build.log.round<iteration>
-
-    Must be saved outside of the results/ directory since it gets wiped away on
-    each round.
-    """
-    buildlog = os.path.join(path, "results", "build.log")
-    shutil.copyfile(buildlog, "{}/build.log.round{}".format(path, iteration))
+def save_mock_logs(path, iteration):
+    """Save Mock build logs to <path>/results/round<iteration>-*.log."""
+    basedir = os.path.join(path, "results")
+    loglist = ["build", "root", "srpm-build", "srpm-root", "mock_srpm", "mock_build"]
+    for l in loglist:
+        src = "{}/{}.log".format(basedir, l)
+        dest = "{}/round{}-{}.log".format(basedir, iteration, l)
+        os.rename(src, dest)
 
 
 def write_prep(workingdir):
-    """
-    Write metadata to the local workingdir when --prep-only is used
-    """
+    """Write metadata to the local workingdir when --prep-only is used."""
     if config.urlban:
         used_url = re.sub(config.urlban, "localhost", tarball.url)
     else:
@@ -153,9 +146,7 @@ def write_prep(workingdir):
 
 
 def main():
-    """
-    Main function for autospec
-    """
+    """Entry point for autospec."""
     parser = argparse.ArgumentParser()
     parser.add_argument("-g", "--skip-git",
                         action="store_false", dest="git", default=True,
@@ -221,7 +212,7 @@ def main():
         if not url:
             try:
                 url = infile_dict.get('URL')
-            except:
+            except Exception:
                 pass
             else:
                 print_infile("Source url found: {}".format(url))
@@ -247,6 +238,7 @@ def main():
 
 
 def package(args, url, name, archives, workingdir, infile_dict):
+    """Entry point for building a package with autospec."""
     check_requirements(args.git)
     build.setup_workingdir(workingdir)
 
@@ -265,14 +257,15 @@ def package(args, url, name, archives, workingdir, infile_dict):
                 for word in dotlic.read().split():
                     if ":" not in word:
                         license.add_license(word)
-        except:
+        except Exception:
             pass
         license.scan_for_licenses(_dir)
         exit(0)
 
     config.setup_patterns()
     config.config_file = args.config
-    config.parse_config_files(build.download_path, args.bump, filemanager)
+    config.parse_config_files(build.download_path, args.bump, filemanager, tarball.version)
+    config.setup_patterns(config.failed_pattern_dir)
     config.parse_existing_spec(build.download_path, tarball.name)
 
     if args.prep_only:
@@ -285,7 +278,7 @@ def package(args, url, name, archives, workingdir, infile_dict):
     license.scan_for_licenses(_dir)
     commitmessage.scan_for_changes(build.download_path, _dir)
     add_sources(build.download_path, archives)
-    test.scan_for_tests(_dir)
+    check.scan_for_tests(_dir)
 
     #
     # Now, we have enough to write out a specfile, and try to build it.
@@ -327,11 +320,12 @@ def package(args, url, name, archives, workingdir, infile_dict):
         if build.round > 20 or build.must_restart == 0:
             break
 
-        save_build_log(build.download_path, build.round)
+        save_mock_logs(build.download_path, build.round)
 
-    test.check_regression(build.download_path)
+    check.check_regression(build.download_path)
 
     if build.success == 0:
+        config.create_buildreq_cache(build.download_path, tarball.version)
         print_fatal("Build failed, aborting")
         sys.exit(1)
     elif os.path.isfile("README.clear"):
@@ -342,7 +336,7 @@ def package(args, url, name, archives, workingdir, infile_dict):
                 print(readme_f.read())
 
             print("*********************\n")
-        except:
+        except Exception:
             pass
 
     examine_abi(build.download_path)
@@ -355,6 +349,7 @@ def package(args, url, name, archives, workingdir, infile_dict):
     logcheck(build.download_path)
 
     commitmessage.guess_commit_message(pkg_integrity.IMPORTED)
+    config.create_buildreq_cache(build.download_path, tarball.version)
 
     if args.git:
         git.commit_to_git(build.download_path)

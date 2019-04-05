@@ -19,18 +19,18 @@
 # Commit to git
 #
 
-import subprocess
 import os
+import subprocess
 
 import build
 import buildpattern
+import config
 import tarball
 from util import call, write_out
-import config
 
 
 def commit_to_git(path):
-
+    """Update package's git tree for autospec managed changes."""
     call("git init", stdout=subprocess.DEVNULL, cwd=path)
 
     # This config is used for setting the remote URI, so it is optional.
@@ -49,17 +49,23 @@ def commit_to_git(path):
     call("git add upstream", cwd=path)
     call("bash -c 'shopt -s failglob; git add *.spec'", cwd=path)
     call("git add %s.tmpfiles" % tarball.name, check=False, stderr=subprocess.DEVNULL, cwd=path)
-    call("git add make_install_append", check=False, stderr=subprocess.DEVNULL, cwd=path)
-    call("git add prep_append", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add prep_prepend", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add build_prepend", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add make_prepend", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add install_prepend", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add install_append", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git add series", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add -f *.asc'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add -f *.sig'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add -f *.sha256'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add -f *.sign'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add -f *.pkey'", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("bash -c 'shopt -s failglob; git add -f *_extras'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git add configure", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git add configure32", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git add configure64", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add configure_avx2", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git add configure_avx512", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git add make_check_command", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add *.patch'", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("bash -c 'shopt -s failglob; git add *.nopatch'", check=False, stderr=subprocess.DEVNULL, cwd=path)
@@ -78,6 +84,8 @@ def commit_to_git(path):
     call("git add description", check=False, stderr=subprocess.DEVNULL, cwd=path)
 
     # remove deprecated config files
+    call("git rm make_install_append", check=False, stderr=subprocess.DEVNULL, cwd=path)
+    call("git rm prep_append", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git rm use_clang", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git rm use_lto", check=False, stderr=subprocess.DEVNULL, cwd=path)
     call("git rm use_avx2", check=False, stderr=subprocess.DEVNULL, cwd=path)
@@ -110,6 +118,7 @@ def commit_to_git(path):
         "*.zip",
         "commitmsg",
         "results/",
+        "rpms/",
         ""
     ]
     write_out(os.path.join(path, '.gitignore'), '\n'.join(ignorelist))

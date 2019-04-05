@@ -19,19 +19,19 @@
 # Deduce and manage build requirements
 #
 
+import ast
 import os
 import re
-import ast
-
-import toml
+import subprocess
 
 import buildpattern
-import util
 import config
-import subprocess
+import toml
+import util
 
 banned_requires = set()
 buildreqs = set()
+buildreqs_cache = set()
 requires = set()
 extra_cmake = set()
 verbose = False
@@ -53,11 +53,10 @@ autoreconf_reqs = ["gettext-bin",
                    "pkg-config-dev"]
 
 
-def add_buildreq(req):
-    """
-    Add req to the global buildreqs set if req is not banned
-    """
+def add_buildreq(req, cache=False):
+    """Add req to the global buildreqs set if req is not banned."""
     global buildreqs
+    global buildreqs_cache
     new = True
 
     req.strip()
@@ -70,14 +69,13 @@ def add_buildreq(req):
         print("  Adding buildreq:", req)
 
     buildreqs.add(req)
+    if cache and new:
+        buildreqs_cache.add(req)
     return new
 
 
 def add_requires(req, override=False):
-    """
-    Add req to the global requires set if it is present in buildreqs and
-    os_packages and is not banned.
-    """
+    """Add req to the global requires set if it is present in buildreqs and os_packages and is not banned."""
     global requires
     new = True
     req = req.strip()
@@ -87,7 +85,7 @@ def add_requires(req, override=False):
         return False
     if req not in buildreqs and req not in config.os_packages and not override:
         if req:
-            print("requirement '{}' not found is buildreqs or os_packages, skipping".format(req))
+            print("requirement '{}' not found in buildreqs or os_packages, skipping".format(req))
         return False
     if new:
         # print("Adding requirement:", req)
@@ -95,21 +93,17 @@ def add_requires(req, override=False):
     return new
 
 
-def add_pkgconfig_buildreq(preq):
-    """
-    Format preq as pkgconfig req and add to buildreqs
-    """
+def add_pkgconfig_buildreq(preq, cache=False):
+    """Format preq as pkgconfig req and add to buildreqs."""
     if config.config_opts['32bit']:
         req = "pkgconfig(32" + preq + ")"
-        add_buildreq(req)
+        add_buildreq(req, cache)
     req = "pkgconfig(" + preq + ")"
-    return add_buildreq(req)
+    return add_buildreq(req, cache)
 
 
 def configure_ac_line(line):
-    """
-    Parse configure_ac line and add appropriate buildreqs
-    """
+    """Parse configure_ac line and add appropriate buildreqs."""
     # print("----\n", line, "\n----")
     # ignore comments
     if line.startswith('#'):
@@ -151,9 +145,7 @@ def configure_ac_line(line):
 
 
 def is_number(num_str):
-    """
-    Return True if num_str can be represented as a number
-    """
+    """Return True if num_str can be represented as a number."""
     try:
         float(num_str)
         return True
@@ -161,12 +153,21 @@ def is_number(num_str):
         return False
 
 
-def parse_modules_list(modules_string):
-    """
-    parse the modules_string for the list of modules, stripping out the version
-    requirements
-    """
-    modules = [m.strip('[]') for m in modules_string.split()]
+def is_version(num_str):
+    """Return True if num_str looks like a version number."""
+    if re.search(r'^\d+(\.\d+)*$', num_str):
+        return True
+
+    return False
+
+
+def parse_modules_list(modules_string, is_cmake=False):
+    """Parse the modules_string for the list of modules, stripping out the version requirements."""
+    if is_cmake:
+        modules = [m for m in re.split(r'\s*([><]?=|\${?[^}]*}?)\s*', modules_string)]
+        modules = filter(None, modules)
+    else:
+        modules = [m.strip('[]') for m in modules_string.split()]
     res = []
     next_is_ver = False
     for mod in modules:
@@ -181,6 +182,9 @@ def parse_modules_list(modules_string):
         if is_number(mod):
             continue
 
+        if is_version(mod):
+            continue
+
         if mod.startswith('$'):
             continue
 
@@ -191,9 +195,7 @@ def parse_modules_list(modules_string):
 
 
 def parse_configure_ac(filename):
-    """
-    Parse the configure.ac file for build requirements
-    """
+    """Parse the configure.ac file for build requirements."""
     buf = ""
     depth = 0
     # print("Configure parse: ", filename)
@@ -218,13 +220,12 @@ def parse_configure_ac(filename):
 
 
 def parse_cargo_toml(filename):
-    """Update build requirements using Cargo.toml
+    """Update build requirements using Cargo.toml.
 
     Set the build requirements for building rust programs using cargo.
     """
     global cargo_bin
     buildpattern.set_build_pattern("cargo", 1)
-    add_buildreq("cargo")
     add_buildreq("rustc")
     with open(filename, "r", encoding="latin-1") as ctoml:
         cargo = toml.loads(ctoml.read())
@@ -238,9 +239,7 @@ def parse_cargo_toml(filename):
 
 
 def set_build_req():
-    """
-    Add build requirements based on the buildpattern pattern
-    """
+    """Add build requirements based on the buildpattern pattern."""
     if buildpattern.default_pattern == "maven":
         maven_reqs = ["apache-maven",
                       "xmvn",
@@ -286,9 +285,7 @@ def set_build_req():
 
 
 def rakefile(filename):
-    """
-    Scan Rakefile for build requirements
-    """
+    """Scan Rakefile for build requirements."""
     with open(filename, "r", encoding="latin-1") as f:
         lines = f.readlines()
 
@@ -304,10 +301,47 @@ def rakefile(filename):
                 print("Rakefile-new: rubygem-" + s)
 
 
+def parse_cmake(filename):
+    """Scan a .cmake or CMakeLists.txt file for what's it's actually looking for."""
+    findpackage = re.compile(r"^[^#]*find_package\((\w+)\b.*\)", re.I)
+    pkgconfig = re.compile(r"^[^#]*pkg_check_modules\s*\(\w+ (.*)\)", re.I)
+    pkg_search_modifiers = {'REQUIRED', 'QUIET', 'NO_CMAKE_PATH',
+                            'NO_CMAKE_ENVIRONMENT_PATH', 'IMPORTED_TARGET'}
+    extractword = re.compile(r'(?:"([^"]+)"|(\S+))(.*)')
+
+    with open(filename, "r", encoding="latin-1") as f:
+        lines = f.readlines()
+    for line in lines:
+        match = findpackage.search(line)
+        if match:
+            module = match.group(1)
+            try:
+                pkg = config.cmake_modules[module]
+                add_buildreq(pkg)
+            except Exception:
+                pass
+
+        match = pkgconfig.search(line)
+        if match:
+            rest = match.group(1)
+            while rest:
+                wordmatch = extractword.search(rest)
+                if not wordmatch:
+                    break
+                rest = wordmatch.group(3)
+                if wordmatch.group(2) in pkg_search_modifiers:
+                    continue
+                # Only one of the two groups can match at a time
+                module = wordmatch.group(1)
+                if not module:
+                    module = wordmatch.group(2)
+                # We have a match, so strip out any version info
+                for m in parse_modules_list(module, is_cmake=True):
+                    add_pkgconfig_buildreq(m)
+
+
 def qmake_profile(filename):
-    """
-    Scan .pro file for build requirements
-    """
+    """Scan .pro file for build requirements."""
     with open(filename, "r", encoding="latin-1") as f:
         lines = f.readlines()
 
@@ -322,17 +356,18 @@ def qmake_profile(filename):
             try:
                 pc = config.qt_modules[module]
                 add_buildreq('pkgconfig({})'.format(pc))
-            except:
+            except Exception:
                 pass
 
 
 def clean_python_req(req, add_python=True):
-    """
-    Strip version information from req
-    """
+    """Strip version information from req."""
     if req.find("#") == 0:
         return ""
     ret = req.rstrip("\n\r").strip()
+    i = ret.find(";")
+    if i > 0:
+        ret = ret[:i]
     i = ret.find("<")
     if i > 0:
         ret = ret[:i]
@@ -362,23 +397,47 @@ def clean_python_req(req, add_python=True):
 
 
 def grab_python_requirements(descfile):
-    """
-    Add python requirements from requirements.txt file
-    """
+    """Add python requirements from requirements.txt file."""
+    if "/demo/" in descfile:
+        return
+    if "/doc/" in descfile:
+        return
+    if "/docs/" in descfile:
+        return
+    if "/example/" in descfile:
+        return
+    if "/test/" in descfile:
+        return
+    if "/tests/" in descfile:
+        return
+
     with open(descfile, "r", encoding="latin-1") as f:
         lines = f.readlines()
 
     for line in lines:
+        # don't add the test section
+        if clean_python_req(line) == '[test]':
+            break
+        if clean_python_req(line) == '[testing]':
+            break
+        if clean_python_req(line) == '[dev]':
+            break
+        if clean_python_req(line) == '[doc]':
+            break
+        if clean_python_req(line) == '[docs]':
+            break
+        if 'pytest' in line:
+            continue
+        if clean_python_req(line) == 'mock':
+            continue
         add_requires(clean_python_req(line))
 
 
 def grab_pip_requirements(pkgname):
-    """
-    Determine python requirements for pkgname using pip show
-    """
+    """Determine python requirements for pkgname using pip show."""
     try:
         pipeout = subprocess.check_output(['/usr/bin/pip3', 'show', pkgname])
-    except:
+    except Exception:
         return
     lines = pipeout.decode("utf-8").split('\n')
     for line in lines:
@@ -392,13 +451,11 @@ def grab_pip_requirements(pkgname):
 
 
 def get_python_build_version_from_classifier(filename):
-    """
-    Detect if setup should use distutils2 or distutils3 only.
+    """Detect if setup should use distutils2 or distutils3 only.
 
     Uses "Programming Language :: Python :: [2,3] :: Only" classifiers in the
     setup.py file.  Defaults to distutils3 if no such classifiers are found.
     """
-
     with open(filename) as setup_file:
         data = setup_file.read()
 
@@ -412,9 +469,7 @@ def get_python_build_version_from_classifier(filename):
 
 
 def add_setup_py_requires(filename):
-    """
-    Detect build requirements listed in setup.py in the install_requires and
-    setup_requires lists.
+    """Detect build requirements listed in setup.py in the install_requires and setup_requires lists.
 
     Handles the following patterns:
     install_requires='one'
@@ -463,7 +518,7 @@ def add_setup_py_requires(filename):
                         if req:
                             add_requires(dep)
 
-                    except:
+                    except Exception:
                         # do not fail, the line contained a variable and
                         # had to be skipped
                         pass
@@ -487,7 +542,7 @@ def add_setup_py_requires(filename):
                     if req:
                         add_requires(dep)
 
-                except:
+                except Exception:
                     # Do not fail, just keep looking
                     pass
 
@@ -509,13 +564,14 @@ def add_setup_py_requires(filename):
                 if req:
                     add_requires(dep)
 
-            except:
+            except Exception:
                 # do not fail, the line contained a variable and had to
                 # be skipped
                 pass
 
 
 def parse_catkin_deps(cmakelists_file):
+    """Determine requirements for catkin packages."""
     f = open(cmakelists_file, "r", encoding="latin-1")
     lines = f.readlines()
     pat = re.compile(r"^find_package.*\(.*(catkin)(?: REQUIRED *)?(?:COMPONENTS (?P<comp>.*))?\)$")
@@ -547,20 +603,47 @@ def parse_catkin_deps(cmakelists_file):
         extra_cmake.add("-DSETUPTOOLS_DEB_LAYOUT=OFF")
 
 
+def is_qmake_pro(f):
+    return f.endswith(".pro") and not f.startswith(".")
+
+
 def scan_for_configure(dirn):
-    """
-    Scan the package directory for build files to determine build pattern
-    """
+    """Scan the package directory for build files to determine build pattern."""
+    if buildpattern.default_pattern == "distutils":
+        add_buildreq("buildreq-distutils")
+    elif buildpattern.default_pattern == "distutils36":
+        add_buildreq("buildreq-distutils36")
+    elif buildpattern.default_pattern == "distutils23":
+        add_buildreq("buildreq-distutils23")
+    elif buildpattern.default_pattern == "distutils3":
+        add_buildreq("buildreq-distutils3")
+    elif buildpattern.default_pattern == "golang":
+        add_buildreq("buildreq-golang")
+    elif buildpattern.default_pattern == "cmake":
+        add_buildreq("buildreq-cmake")
+    elif buildpattern.default_pattern == "configure":
+        add_buildreq("buildreq-configure")
+    elif buildpattern.default_pattern == "qmake":
+        add_buildreq("buildreq-qmake")
+    elif buildpattern.default_pattern == "cpan":
+        add_buildreq("buildreq-cpan")
+    elif buildpattern.default_pattern == "scons":
+        add_buildreq("buildreq-scons")
+    elif buildpattern.default_pattern == "R":
+        add_buildreq("buildreq-R")
+
     count = 0
     for dirpath, _, files in os.walk(dirn):
         default_score = 2 if dirpath == dirn else 1
 
         if any(f.endswith(".go") for f in files):
-            add_buildreq("go")
+            add_buildreq("buildreq-golang")
             buildpattern.set_build_pattern("golang", default_score)
+            if "go.mod" in files:
+                config.set_gopath = False
 
         if "CMakeLists.txt" in files and "configure.ac" not in files:
-            add_buildreq("cmake")
+            add_buildreq("buildreq-cmake")
             buildpattern.set_build_pattern("cmake", default_score)
 
             srcdir = os.path.abspath(os.path.join(dirn, "clr-build", config.cmake_srcdir or ".."))
@@ -569,39 +652,32 @@ def scan_for_configure(dirn):
 
         if "configure" in files and os.access(dirpath + '/configure', os.X_OK):
             buildpattern.set_build_pattern("configure", default_score)
-        elif any(f.endswith(".pro") for f in files):
-            add_buildreq("qtbase-dev")
-            add_buildreq("qtbase-extras")
+        elif any(is_qmake_pro(f) for f in files):
+            add_buildreq("buildreq-qmake")
             buildpattern.set_build_pattern("qmake", default_score)
 
         if "requires.txt" in files:
             grab_python_requirements(dirpath + '/requires.txt')
 
         if "setup.py" in files:
-            add_buildreq("python-dev")
-            add_buildreq("python3-dev")
-            add_buildreq("setuptools")
-            add_buildreq("pbr")
-            add_buildreq("pip")
+            add_buildreq("buildreq-distutils3")
             add_setup_py_requires(dirpath + '/setup.py')
             python_pattern = get_python_build_version_from_classifier(dirpath + '/setup.py')
             buildpattern.set_build_pattern(python_pattern, default_score)
 
         if "Makefile.PL" in files or "Build.PL" in files:
             buildpattern.set_build_pattern("cpan", default_score)
+            add_buildreq("buildreq-cpan")
 
         if "SConstruct" in files:
-            add_buildreq("scons")
-            add_buildreq("python-dev")
+            add_buildreq("buildreq-scons")
             buildpattern.set_build_pattern("scons", default_score)
 
         if "requirements.txt" in files:
             grab_python_requirements(dirpath + '/requirements.txt')
 
         if "meson.build" in files:
-            add_buildreq("meson")
-            add_buildreq("ninja")
-            add_buildreq("python3")
+            add_buildreq("buildreq-meson")
             buildpattern.set_build_pattern("meson", default_score)
 
         for name in files:
@@ -619,6 +695,9 @@ def scan_for_configure(dirn):
                 buildpattern.set_build_pattern("autogen", default_score)
             if name.lower() == "cmakelists.txt":
                 buildpattern.set_build_pattern("cmake", default_score)
+            if (name.lower() == "cmakelists.txt" or name.endswith(".cmake")) \
+               and buildpattern.default_pattern == "cmake":
+                parse_cmake(os.path.join(dirpath, name))
 
     can_reconf = os.path.exists(os.path.join(dirn, "configure.ac"))
     if not can_reconf:
@@ -642,9 +721,7 @@ def scan_for_configure(dirn):
 
 
 def load_specfile(specfile):
-    """
-    Load specfile object with necessary buildreq data
-    """
+    """Load specfile object with necessary buildreq data."""
     specfile.buildreqs = buildreqs
     specfile.requires = requires
     specfile.cargo_bin = cargo_bin

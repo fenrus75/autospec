@@ -21,15 +21,18 @@
 # exact matches on hashes of the COPYING file
 #
 
-import sys
+import hashlib
 import os
 import re
-import tarball
-import pycurl
+import shlex
+import sys
 import urllib.parse
-import config
-from io import BytesIO
 
+import chardet
+import config
+import download
+
+import tarball
 from util import print_fatal, print_warning
 
 default_license = "TO BE DETERMINED"
@@ -38,8 +41,19 @@ licenses = []
 license_files = []
 
 
-def add_license(lic):
+def process_licenses(lics):
+    """Handle licenses string from the license server.
+
+    The license server response may contain multiple space-separated licenses.
+    Add each license individually.
     """
+    for lic in lics.split():
+        add_license(lic)
+
+
+def add_license(lic):
+    """Add licenses from the server.
+
     Add license from license string lic after checking for duplication or
     presence in the blacklist. Returns False if no license were added, True
     otherwise.
@@ -63,40 +77,45 @@ def add_license(lic):
 
 
 def license_from_copying_hash(copying, srcdir):
-    """Add licenses based on the hash of the copying file"""
-    hash_sum = tarball.get_sha1sum(copying)
+    """Add licenses based on the hash of the copying file."""
+    data = tarball.get_contents(copying)
+    if data.startswith(b'#!'):
+        # Not a license if this is a script
+        return
+
+    sh = hashlib.sha1()
+    sh.update(data)
+    hash_sum = sh.hexdigest()
+
+    """ decode license text """
+    detected = chardet.detect(data)
+    license_charset = detected['encoding']
+    if license_charset == 'ISO-8859-1':
+        if b'\xff' in data:
+            license_charset = 'ISO-8859-13'
+        elif b'\xd2' in data and b'\xd3' in data:
+            license_charset = 'mac_roman'
+    if not license_charset:
+        # This is not a text file
+        return
+
+    data = data.decode(license_charset)
 
     if config.license_fetch:
-        with open(copying, "r", encoding="latin-1") as myfile:
-            data = myfile.read()
-
         values = {'hash': hash_sum, 'text': data, 'package': tarball.name}
         data = urllib.parse.urlencode(values)
         data = data.encode('utf-8')
 
-        buffer = BytesIO()
-        c = pycurl.Curl()
-        c.setopt(c.URL, config.license_fetch)
-        c.setopt(c.WRITEDATA, buffer)
-        c.setopt(c.POSTFIELDS, data)
-        c.setopt(c.FOLLOWLOCATION, 1)
-        try:
-            c.perform()
-        except Exception as excep:
-            print_fatal("Failed to fetch license from {}: {}"
-                        .format(config.license_fetch, excep))
-            c.close()
-            sys.exit(1)
-
-        c.close()
-
+        buffer = download.do_curl(config.license_fetch, post=data, is_fatal=True)
         response = buffer.getvalue()
         page = response.decode('utf-8').strip()
         if page:
             print("License     : ", page, " (server) (", hash_sum, ")")
-            add_license(page)
+            process_licenses(page)
+
             if page != "none":
-                license_files.append(copying[len(srcdir) + 1:])
+                lic_path = copying[len(srcdir) + 1:]
+                license_files.append(shlex.quote(lic_path))
 
             return
 
@@ -111,21 +130,20 @@ def license_from_copying_hash(copying, srcdir):
 
 
 def scan_for_licenses(srcdir):
-    """
-    Scan the project directory for things we can use to guess a description
-    and summary
-    """
+    """Scan the project directory for things we can use to guess a description and summary."""
     targets = ["copyright",
                "copyright.txt",
                "apache-2.0",
+               "artistic.txt",
                "libcurllicense",
                "gpl.txt",
+               "gpl2.txt",
                "gplv2.txt",
                "notice",
                "copyrights",
                "about_bsd.txt"]
-    # look for files that start with copying or licen[cs]e (spelling errors)
-    # or end with licen[cs]e
+    # look for files that start with copying or licen[cs]e (but are
+    # not likely scripts) or end with licen[cs]e
     target_pat = re.compile(r"^((copying)|(licen[cs]e))|(licen[cs]e)$")
     for dirpath, dirnames, files in os.walk(srcdir):
         for name in files:
@@ -140,7 +158,8 @@ def scan_for_licenses(srcdir):
 
 
 def load_specfile(specfile):
+    """Get licenses from the specfile content."""
     global licenses
     global license_files
     specfile.licenses = licenses if licenses else [default_license]
-    specfile.license_files = license_files
+    specfile.license_files = sorted(license_files)

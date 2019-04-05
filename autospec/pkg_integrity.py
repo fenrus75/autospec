@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 
+import argparse
+import hashlib
+import json
 import os
 import re
-import sys
-import argparse
 import shutil
-import tempfile
-import pycurl
-import hashlib
 import signal
-import json
-from urllib.parse import urlparse
-from io import BytesIO
+import sys
+import tempfile
 from contextlib import contextmanager
-from subprocess import Popen, PIPE, TimeoutExpired
+from subprocess import PIPE, Popen, TimeoutExpired
+from urllib.parse import urlparse
 
 import config
+import download
 import util
 
 GPG_CLI = False
@@ -55,6 +54,7 @@ CHUNK_SIZE = 2056
 
 
 def update_gpg_conf(proxy_value):
+    """Set GNUPGCONF with http_proxy value."""
     global GNUPGCONF
     GNUPGCONF = "{}\nkeyserver-options http-proxy={}".format(GNUPGCONF, proxy_value)
 
@@ -67,16 +67,19 @@ elif 'HTTP_PROXY' in ENV.keys():
 
 # CLI interface to gpg command
 class GPGCliStatus(object):
-    """Mock gpgmeerror"""
+    """Mock gpgmeerror."""
+
     def __init__(self, strerror):
+        """Initialize mock GPGCliStatus."""
         self.strerror = strerror
 
 
 class GPGCli(object):
-    """cli wrapper for gpg"""
+    """CLI wrapper for gpg."""
 
     @staticmethod
     def exec_cmd(args):
+        """Popen wrapper."""
         proc = Popen(args, stdout=PIPE, stderr=PIPE)
         try:
             out, err = proc.communicate(timeout=CMD_TIMEOUT)
@@ -86,6 +89,7 @@ class GPGCli(object):
         return out, err, proc.returncode
 
     def __init__(self, pubkey=None, home=None):
+        """Set GPGCli defaults."""
         _gpghome = home
         if _gpghome is None:
             _gpghome = tempfile.mkdtemp(prefix='tmp.gpghome')
@@ -102,6 +106,7 @@ class GPGCli(object):
         self._home = _gpghome
 
     def verify(self, _, tarfile, signature):
+        """Validate tarfile with signature."""
         args = self.args + ['--verify', signature, tarfile]
         output, err, code = self.exec_cmd(args)
         if code == 0:
@@ -111,6 +116,7 @@ class GPGCli(object):
         return GPGCliStatus(err.decode('utf-8'))
 
     def import_key(self, keyid):
+        """Import signer key."""
         args = self.args + ['--recv-keys', keyid]
         output, err, code = self.exec_cmd(args)
         if code == 0:
@@ -120,6 +126,7 @@ class GPGCli(object):
         return GPGCliStatus(err.decode('utf-8')), None
 
     def export_key(self, keyid):
+        """Export signer key with armor."""
         args = self.args + ['--armor', '--export', keyid]
         output, err, code = self.exec_cmd(args)
         if output.decode('utf-8') == '':
@@ -129,6 +136,7 @@ class GPGCli(object):
         return GPGCliStatus(err.decode('utf-8')), None
 
     def display_keyinfo(self, keyfile):
+        """Show signer key information."""
         args = self.args + ['--list-packet', keyfile]
         lp, err, code = self.exec_cmd(args)
         if code != 0:
@@ -148,6 +156,7 @@ class GPGCli(object):
 
 @contextmanager
 def cli_gpg_ctx(pubkey=None, gpghome=None):
+    """Return correctly initialized GPGCli."""
     if pubkey is None:
         yield GPGCli()
     else:
@@ -164,29 +173,30 @@ def cli_gpg_ctx(pubkey=None, gpghome=None):
 
 # Use gpg command line
 def verify_cli(pubkey, tarball, signature, gpghome=None):
+    """Validate tarfile with signature."""
     with cli_gpg_ctx(pubkey, gpghome) as ctx:
         return ctx.verify(pubkey, tarball, signature)
     raise Exception('Verification did not take place using cli')
 
 
 class Verifier(object):
+    """Base validation class."""
 
     def __init__(self, **kwargs):
+        """Set default values."""
         self.url = kwargs.get('url', None)
         self.package_sign_path = kwargs.get('package_sign_path', None)
         print(SEPT)
 
     @staticmethod
-    def download_file(url, destination):
-        return attempt_to_download(url, destination)
-
-    @staticmethod
     def quit():
+        """Stop verification."""
         print('Critical error quitting...')
         exit(1)
 
     @staticmethod
     def calc_sum(filepath, digest_algo):
+        """Use digest_algo to calculate block sum of a file."""
         BLOCK_SIZE = 4096
         with open(filepath, 'rb') as fp:
             digest = digest_algo()
@@ -195,6 +205,7 @@ class Verifier(object):
             return digest.hexdigest()
 
     def print_result(self, result, err_msg=''):
+        """Display verification results."""
         global EMAIL
         package_name = ''
         if self.url is not None:
@@ -207,46 +218,46 @@ class Verifier(object):
             print_error(msg)
 
     def __del__(self):
+        """Display partition."""
         print(SEPT)
 
 
-def head_request(url):
-    curl = pycurl.Curl()
-    curl.setopt(curl.URL, url)
-    curl.setopt(curl.CUSTOMREQUEST, "HEAD")
-    curl.setopt(curl.NOBODY, True)
-    curl.setopt(curl.TIMEOUT, 5)
-    curl.perform()
-    http_code = curl.getinfo(pycurl.HTTP_CODE)
-    curl.close()
-    return http_code
-
-
-def get_signature_url(package_url):
+def get_signature_file(package_url, package_path):
+    """Attempt to build signature file URL and download it."""
+    sign_urls = []
     if 'samba.org' in package_url:
-        return package_url + '.asc'
+        sign_urls.append(package_url + '.asc')
     elif '://pypi.' in package_url[:13]:
-        return package_url + '.asc'
+        sign_urls.append(package_url + '.asc')
     elif 'mirrors.kernel.org' in package_url:
-        return package_url + '.sig'
+        sign_urls.append(package_url + '.sig')
     else:
-        try:
-            iter = (package_url + "." + ext for ext in ("asc", "sig", "sign"))
-            for sign_url in iter:
-                if head_request(sign_url) in (200, 302):
-                    return sign_url
-        except:
-            pass
+        iter = (package_url + "." + ext for ext in ("asc", "sig", "sign"))
+        for sign_url in iter:
+            sign_urls.append(sign_url)
+
+    sign_file = None
+    dest = None
+    for url in sign_urls:
+        dest = os.path.join(package_path, os.path.basename(url))
+        sign_file = download.do_curl(url, dest)
+        if sign_file is not None:
+            return sign_file
+
     return None
 
 
 def get_hash_url(package_url):
+    """Get hash url based on package url."""
     if 'download.gnome.org' in package_url:
         return package_url.replace('.tar.xz', '.sha256sum')
+    if 'download.qt.io' in package_url:
+        return package_url + '.sha256'
     return None
 
 
 def compare_keys(newkey, oldkey):
+    """Key comparison to check against key tampering."""
     if newkey != oldkey:
         print_error('Public key has changed:\n'
                     '            old key: {}\n'
@@ -258,13 +269,16 @@ def compare_keys(newkey, oldkey):
 
 # sha256sum Verifier
 class ShaSumVerifier(Verifier):
+    """Extend verification for sha sums."""
 
     def __init__(self, **kwargs):
+        """Add shalen initialization."""
         Verifier.__init__(self, **kwargs)
         self.package_path = kwargs.get('package_path', None)
         self.shalen = kwargs.get('shalen', 256)
 
     def verify_sum(self, shasum):
+        """Verify sha sum."""
         print("Verifying sha{}sum digest\n".format(self.shalen))
         if shasum is None:
             self.print_result(False, err_msg='Verification requires shasum')
@@ -288,13 +302,16 @@ class ShaSumVerifier(Verifier):
 
 # MD5 Verifier
 class MD5Verifier(Verifier):
+    """Extend verification for MD5."""
 
     def __init__(self, **kwargs):
+        """Add MD5 initialization."""
         Verifier.__init__(self, **kwargs)
         self.package_path = kwargs.get('package_path', None)
         self.md5_digest = kwargs.get('md5_digest', None)
 
     def verify_md5(self):
+        """Verify MD5."""
         print("Verifying MD5 digest\n")
         if self.md5_digest is None:
             self.print_result(False, err_msg='Verification requires a md5_digest')
@@ -309,34 +326,36 @@ class MD5Verifier(Verifier):
 
 # gnome.org Verifier
 class GnomeOrgVerifier(ShaSumVerifier):
+    """Verify sha sums for gnome.org."""
 
     def __init__(self, **kwargs):
+        """Initialize with gnome.org url."""
         kwargs.update({'shalen': 256})
         self.package_url = kwargs.get('url', None)
         ShaSumVerifier.__init__(self, **kwargs)
 
     @staticmethod
-    def get_shasum_url(package_url):
-        url = "{}.sha256sum".format(package_url.replace(".tar.xz", ""))
-        if head_request(url) == 200:
-            return url
-        url = "{}.sha256sum".format(package_url)
-        if head_request(url) == 200:
-            return url
-        return None
+    def fetch_shasum(shasum_url):
+        """Get shasum file from gnome.org."""
+        data = download.do_curl(shasum_url)
+        if data:
+            return data.getvalue().decode('utf-8')
+        else:
+            return None
 
     @staticmethod
     def get_shasum(package_url):
-        data = BytesIO()
-        curl = pycurl.Curl()
-        curl.setopt(curl.URL, package_url)
-        curl.setopt(curl.WRITEFUNCTION, data.write)
-        curl.setopt(curl.FOLLOWLOCATION, True)
-        curl.perform()
-        return data.getvalue().decode('utf-8')
+        """Try and get sha url based on package url."""
+        for shasum_url in (package_url.replace(".tar.xz", ".sha256sum"),
+                           "{}.sha256sum".format(package_url)):
+            shasum = GnomeOrgVerifier.fetch_shasum(shasum_url)
+            if shasum:
+                return shasum
+        return None
 
     @staticmethod
     def parse_shasum(shasum_text):
+        """Parse shasum from sha url file content."""
         for line in shasum_text.split('\n'):
             sha, file = [col for col in line.split(' ') if col != '']
             if ".tar.xz" in file:
@@ -344,32 +363,35 @@ class GnomeOrgVerifier(ShaSumVerifier):
         return None
 
     def verify(self):
+        """Verify tar file with sha from gnome.org."""
         if self.package_url is None:
             self.print_result(False, err_msg='Package URL can not be None for GnomeOrgVerifier')
             return None
-        shasum_url = self.get_shasum_url(self.package_url)
-        if shasum_url is None:
+        shasum = self.get_shasum(self.package_url)
+        if shasum is None:
             self.print_result(False, err_msg='Unable to find shasum URL for {}'.format(self.package_url))
             return None
-        shasum = self.get_shasum(shasum_url)
         shasum = self.parse_shasum(shasum)
         if shasum is None:
-            self.print_result(False, err_msg='Unable to parse shasum {}'.format(shasum_url))
+            self.print_result(False, err_msg='Unable to parse shasum {}'.format(shasum))
             return None
         return self.verify_sum(shasum)
 
 
 # PyPi Verifier
 class PyPiVerifier(MD5Verifier):
+    """Verify MD5 signature for pypi."""
 
     def __init__(self, **kwargs):
+        """Passthrough initialization to MD5."""
         MD5Verifier.__init__(self, **kwargs)
 
     def parse_name(self):
+        """Get pypi package name and release number."""
         pkg_name = os.path.basename(self.package_path)
-        name, _ = re.split('-\d+\.', pkg_name, maxsplit=1)
+        name, _ = re.split(r'-\d+\.', pkg_name, maxsplit=1)
         release_no = pkg_name.replace(name + '-', '')
-        extensions = "({})".format("|".join(['\.tar\.gz$', '\.zip$', '\.tgz$', '\.tar\.bz2$']))
+        extensions = "({})".format("|".join([r'\.tar\.gz$', r'\.zip$', r'\.tgz$', r'\.tar\.bz2$']))
         ext = re.search(extensions, release_no)
         if ext is not None:
             release_no = release_no.replace(ext.group(), '')
@@ -377,28 +399,28 @@ class PyPiVerifier(MD5Verifier):
 
     @staticmethod
     def get_info(package_name):
+        """Get json dump of pypi package."""
         url = PYPIORG_API.format(package_name)
-        data = BytesIO()
-        curl = pycurl.Curl()
-        curl.setopt(curl.URL, url)
-        curl.setopt(curl.WRITEFUNCTION, data.write)
-        curl.setopt(curl.FOLLOWLOCATION, True)
-        curl.perform()
-        json_data = json.loads(data.getvalue().decode('utf-8'))
-        return json_data
+        data = download.do_curl(url)
+        if data:
+            return json.loads(data.getvalue().decode('utf-8'))
+        else:
+            return None
 
     @staticmethod
     def get_source_release(package_fullname, releases):
+        """Lookup release for package name."""
         for release in releases:
             if release.get('filename', 'not_found') == package_fullname:
                 return release
         return None
 
     def verify(self):
+        """Verify pypi file with MD5."""
         global EMAIL
         print("Searching for package information in pypi")
         name, release = self.parse_name()
-        info = self.get_info(name)
+        info = PyPiVerifier.get_info(name)
         releases_info = info.get('releases', None)
         if releases_info is None:
             self.print_result(False, err_msg='Error in package info from {}'.format(PYPIORG_API))
@@ -418,8 +440,10 @@ class PyPiVerifier(MD5Verifier):
 
 # GPG Verification
 class GPGVerifier(Verifier):
+    """Verify GPG signature."""
 
     def __init__(self, **kwargs):
+        """Initialize gpg signature validation."""
         Verifier.__init__(self, **kwargs)
         self.key_url = kwargs.get('key_url', None)
         self.package_path = kwargs.get('package_path', None)
@@ -428,10 +452,6 @@ class GPGVerifier(Verifier):
         if not self.key_url and self.package_check:
             # signature exists locally, don't try to download self.url
             self.key_url = self.url.rstrip('/') + get_file_ext(self.package_check)
-        if not self.key_url and self.url:
-            # signature does not exist locally, find signature url from self.url,
-            # may require a HEAD request.
-            self.key_url = get_signature_url(self.url)
         if not self.package_sign_path:
             # the key exists (or will exist) at
             # <package directory>/<key url basename>
@@ -441,14 +461,16 @@ class GPGVerifier(Verifier):
         self.pubkey_path = os.path.join(os.path.dirname(self.package_path), "{}.pkey")
 
     def get_sign(self):
-        code = self.download_file(self.key_url, self.package_sign_path)
-        if code == 200:
+        """Attempt to download gpg signature file."""
+        sign_file = download.do_curl(self.key_url, self.package_sign_path)
+        if sign_file is not None:
             return True
         else:
-            msg = "Unable to download file {} http code {}"
-            self.print_result(False, msg.format(self.key_url, code))
+            msg = "Unable to download file {}"
+            self.print_result(False, msg.format(self.key_url))
 
     def verify(self, recursion=False):
+        """Verify file using gpg signature."""
         global KEYID
         global EMAIL
         print("Verifying GPG signature\n")
@@ -460,7 +482,10 @@ class GPGVerifier(Verifier):
             return None
         if sign_isvalid(self.package_sign_path) is False:
             self.print_result(False, err_msg='{} is not a GPG signature'.format(self.package_sign_path))
-            os.unlink(self.package_sign_path)
+            try:
+                os.unlink(self.package_sign_path)
+            except Exception:
+                pass
             return None
         # valid signature exists at package_sign_path, operate on it now
         keyid = get_keyid(self.package_sign_path)
@@ -493,30 +518,33 @@ class GPGVerifier(Verifier):
 
 
 def quit_verify():
+    """Halt build due to verification being required."""
     print_error("verification required for build (verify_required option set)")
     Verifier.quit()
 
 
 # GEM Verifier
 class GEMShaVerifier(Verifier):
+    """Verify signatures for ruby gems."""
 
     def __init__(self, **kwargs):
+        """Initialize gem verification."""
         self.package_path = kwargs.get('package_path', None)
         Verifier.__init__(self, **kwargs)
 
     @staticmethod
     def get_rubygems_info(package_name):
+        """Get json dump of ruby gem."""
         url = RUBYORG_API.format(package_name)
-        data = BytesIO()
-        curl = pycurl.Curl()
-        curl.setopt(curl.URL, url)
-        curl.setopt(curl.WRITEFUNCTION, data.write)
-        curl.perform()
-        json_data = json.loads(data.getvalue().decode('utf-8'))
-        return json_data
+        data = download.do_curl(url)
+        if data:
+            return json.loads(data.getvalue().decode('utf-8'))
+        else:
+            return None
 
     @staticmethod
     def get_gemnumber_sha(gems, number):
+        """Get sha for a gem based on the gem's number."""
         mygem = [gem for gem in gems if gem.get('number', -100) == number]
         if len(mygem) == 1:
             return mygem[0].get('sha', None)
@@ -524,15 +552,16 @@ class GEMShaVerifier(Verifier):
             return None
 
     def verify(self):
+        """Verify ruby gem based on sha sum."""
         gemname = os.path.basename(self.package_path).replace('.gem', '')
         print("Verifying SHA256 checksum\n")
         if os.path.exists(self.package_path) is False:
             self.print_result(False, 'GEM was not found {}'.format(self.package_path))
             return
-        name, _ = re.split('-\d+\.', gemname)
+        name, _ = re.split(r'-\d+\.', gemname)
         number = gemname.replace(name + '-', '')
-        geminfo = self.get_rubygems_info(name)
-        gemsha = self.get_gemnumber_sha(geminfo, number)
+        geminfo = GEMShaVerifier.get_rubygems_info(name)
+        gemsha = GEMShaVerifier.get_gemnumber_sha(geminfo, number)
 
         if geminfo is None:
             self.print_result(False, "unable to parse info for gem {}".format(gemname))
@@ -557,38 +586,45 @@ VERIFIER_TYPES = {
 
 
 def get_file_ext(filename):
+    """Return filename extension."""
     return os.path.splitext(filename)[1]
 
 
 def get_verifier(filename):
+    """Return verification based on filename."""
     ext = get_file_ext(filename)
     return VERIFIER_TYPES.get(ext, None)
 
 
 def get_input(message, default):
+    """Parse user input."""
     try:
         import_key = input(message)
         if import_key == '':
             import_key = default
         return import_key.lower() == 'y'
-    except:
+    except Exception:
         return None
 
 
 def input_timeout(signum, frame):
+    """Handle input timeouts."""
     print('\ninput timed out')
     raise Exception('keyboard timed out')
 
 
 class InputGetter(object):
+    """Simple class for user input."""
 
     def __init__(self, message='?', default='N', timeout=INPUT_GETTER_TIMEOUT):
+        """Initialize input class."""
         self.message = message
         self.default = default
         self.timeout = timeout
         signal.signal(signal.SIGALRM, input_timeout)
 
     def get_answer(self):
+        """Read user input."""
         signal.alarm(self.timeout)
         inpt = get_input(self.message, self.default)
         signal.alarm(0)
@@ -596,6 +632,7 @@ class InputGetter(object):
 
 
 def attempt_key_import(keyid, key_fullpath):
+    """Ask user to import key."""
     global IMPORTED
     print(SEPT)
     ig = InputGetter('\nDo you want to attempt to import keyid {}: (y/N) '.format(keyid))
@@ -629,9 +666,7 @@ def attempt_key_import(keyid, key_fullpath):
 
 
 def parse_key(filename, pattern, verbose=True):
-    """
-    Parse gpg --list-packet signature for pattern, return first match
-    """
+    """Parse gpg --list-packet signature for pattern, return first match."""
     args = ["gpg", "--list-packet", filename]
     try:
         out, err = Popen(args, stdout=PIPE, stderr=PIPE).communicate()
@@ -641,12 +676,13 @@ def parse_key(filename, pattern, verbose=True):
         out = out.decode('utf-8')
         match = re.search(pattern, out)
         return match.group(1).strip() if match else None
-    except:
+    except Exception:
         return None
     return None
 
 
 def get_keyid(sig_filename):
+    """Get keyid from signature file and set global KEYID_TRY."""
     global KEYID_TRY
     keyid = parse_key(sig_filename, r'keyid (.+?)\n')
     KEYID_TRY = keyid
@@ -654,47 +690,33 @@ def get_keyid(sig_filename):
 
 
 def sign_isvalid(sig_filename):
+    """Get keyid from signature file."""
     keyid = parse_key(sig_filename, r'keyid (.+?)\n', verbose=False)
     return keyid is not None
 
 
-def attempt_to_download(url, sign_filename=None):
-    """Download file helper"""
-    with open(sign_filename, 'wb') as f:
-        curl = pycurl.Curl()
-        curl.setopt(curl.URL, url)
-        curl.setopt(curl.WRITEDATA, f)
-        curl.setopt(curl.FOLLOWLOCATION, True)
-        try:
-            curl.perform()
-        except pycurl.error as e:
-            print(e.args)
-            return None
-        code = curl.getinfo(pycurl.HTTP_CODE)
-        curl.close()
-        if code != 200:
-            os.unlink(sign_filename)
-        return code
-    return None
-
-
 def filename_from_url(url):
+    """Run os.path.basename for a url."""
     return os.path.basename(url)
 
 
 def print_success(msg):
+    """Display success color code."""
     print("\033[92mSUCCESS:\033[0m {}".format(msg))
 
 
 def print_error(msg):
+    """Display error color code."""
     print("\033[91mERROR  :\033[0m {}".format(msg))
 
 
 def print_info(msg):
+    """Display info color code."""
     print("\033[93mINFO   :\033[0m {}".format(msg))
 
 
 def apply_verification(verifier, **kwargs):
+    """Attempt to run verification routine."""
     if verifier is None:
         print_error("Package is not verifiable (yet)")
     else:
@@ -702,17 +724,8 @@ def apply_verification(verifier, **kwargs):
         return v.verify()
 
 
-def from_url(url, download_path, interactive=True):
-    package_name = filename_from_url(url)
-    package_path = os.path.join(download_path, package_name)
-    verifier = get_verifier(package_name)
-    return apply_verification(verifier, **{
-                              'package_path': package_path,
-                              'url': url,
-                              'interactive': interactive})
-
-
 def from_disk(url, package_path, package_check, interactive=True):
+    """Run verification."""
     verifier = get_verifier(package_path)
     return apply_verification(verifier, **{
                               'package_path': package_path,
@@ -722,6 +735,7 @@ def from_disk(url, package_path, package_check, interactive=True):
 
 
 def attempt_verification_per_domain(package_path, url):
+    """Use url domain name to set verification type."""
     netloc = urlparse(url).netloc
     if 'pypi' in netloc:
         domain = 'pypi'
@@ -744,17 +758,16 @@ def attempt_verification_per_domain(package_path, url):
 
 
 def get_integrity_file(package_path):
-    if os.path.exists(package_path + '.asc'):
-        return package_path + '.asc'
-    if os.path.exists(package_path + '.sig'):
-        return package_path + '.sig'
-    if os.path.exists(package_path + '.sign'):
-        return package_path + '.sign'
-    if os.path.exists(package_path + '.sha256'):
-        return package_path + '.sha256'
+    """Get verification filename."""
+    iter = (package_path + "." + ext for ext in ("asc", "sig", "sign", "sha256"))
+    for sign_file in iter:
+        if os.path.isfile(sign_file):
+            return sign_file
+    return None
 
 
 def check(url, download_path, interactive=True):
+    """Run verification based on tar file url."""
     package_name = filename_from_url(url)
     package_path = os.path.join(download_path, package_name)
     package_check = get_integrity_file(package_path)
@@ -768,13 +781,13 @@ def check(url, download_path, interactive=True):
     if package_check is not None:
         verified = from_disk(url, package_path, package_check, interactive=interactive)
     elif package_path[-4:] == '.gem':
-        verified = from_url(url, download_path, interactive=interactive)
+        signature_file = get_signature_file(url, download_path)
+        verified = from_disk(url, package_path, signature_file, interactive=interactive)
     else:
-        print_info('{}.asc or {}.sha256 not found'.format(package_name, package_name))
-        signature_url = get_signature_url(url)
-        if signature_url is not None:
-            print_info('Attempting to download {}'.format(signature_url))
-            verified = from_url(url, download_path)
+        print_info('None of {}.(asc|sig|sign|sha256) is found in {}'.format(package_name, download_path))
+        signature_file = get_signature_file(url, download_path)
+        if signature_file is not None:
+            verified = from_disk(url, package_path, signature_file, interactive=interactive)
             if verified is None:
                 print_info('Unable to find a signature, attempting domain verification')
                 verified = attempt_verification_per_domain(package_path, url)
@@ -789,6 +802,7 @@ def check(url, download_path, interactive=True):
 
 
 def parse_args():
+    """Set args for tarfile verification."""
     parser = argparse.ArgumentParser(usage=USAGE, description=DESCRIPTION)
     parser.add_argument('--tar', required=True,
                         help='tar file to check signature')
@@ -802,11 +816,13 @@ def parse_args():
 
 
 def load_specfile(specfile):
+    """Set key and email in specfile."""
     specfile.keyid = KEYID
     specfile.email = EMAIL
 
 
 def main(args):
+    """Verify tar content with signature."""
     from_disk(args.url, args.tar, args.sig)
 
 

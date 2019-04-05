@@ -128,7 +128,7 @@ class TestFiles(unittest.TestCase):
         self.fm.push_package_file = MagicMock()
         autostart = '/usr/lib/systemd/system/some.target.wants/some'
         self.fm.push_file(autostart)
-        calls = [call(autostart, 'autostart'), call('%exclude ' + autostart, 'config')]
+        calls = [call(autostart, 'autostart'), call('%exclude ' + autostart, 'services')]
         self.fm.push_package_file.assert_has_calls(calls)
 
     def test_push_file_extras(self):
@@ -140,6 +140,18 @@ class TestFiles(unittest.TestCase):
         self.fm.extras.append('test')
         self.fm.push_file('test')
         calls = [call('test', 'extras'), call('%exclude test')]
+        self.fm.push_package_file.assert_has_calls(calls)
+
+
+    def test_push_file_custom_extras(self):
+        """
+        Test push_file to a custom extras package, this excludes the file
+        """
+        self.fm.file_is_locale = MagicMock(return_value=False)
+        self.fm.push_package_file = MagicMock()
+        self.fm.custom_extras = {'test-extras': {'files': ["test"]}}
+        self.fm.push_file('test')
+        calls = [call('test', 'test-extras'), call('%exclude test')]
         self.fm.push_package_file.assert_has_calls(calls)
 
 

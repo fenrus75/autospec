@@ -145,7 +145,11 @@ Variables included:
     * Build dependencies
     * Commands - These are appended to the associated files as comments
       * ``configure``
-      * ``make_install_append``
+      * ``prep_prepend``
+      * ``build_prepend``
+      * ``make_prepend``
+      * ``install_prepend``
+      * ``install_append``
 
 
 Control files
@@ -221,6 +225,11 @@ configure
   ``./configure`` for an autootools based tarball would result in ``%configure
   --disable-static`` being emitted in the ``.spec``.
 
+configure32, configure64, configure_avx2, configure_avx512
+  These files are appended to the ``%configure'' macro after the
+  contents of the ``configure'' file above. They are used for 32-bit,
+  regular 64-bit, AVX2 and AVX512 builds, respectively.
+
 cmake_args
   This file contains arguments that should be passed to the ``%cmake`` macro for
   CMake based tarballs. As an example, adding ``-DUSE_LIB64=ON`` to
@@ -245,13 +254,41 @@ make32_install_args
   macro in the ``.spec`` for the 32bit build. Again it is appended after
   make_install_args so 32bit specific overrides can be added.
 
-make_install_append
-  Additional actions that should take place after the ``make install`` step has
-  completed. This will be placed in the resulting ``.spec``, and is used for
+prep_prepend
+  Additional actions that should take place directly after ``%prep``
+  and before the ``%setup`` macro.  This will be placed in the
+  resulting ``.spec``, and is used for situations where fine-grained
+  control is required.
+
+build_prepend
+  Additional actions that should take place directly after ``%build``
+  and before the ``%configure`` macro or equivalent (``%cmake``,
+  etc.). If autospec is creating AVX2, AVX-512 or 32-bit, these
+  actions will be repeated for each of those builds, This will be
+  placed in the resulting ``.spec``, and is used for situations where
+  fine-grained control is required.
+
+make_prepend
+  Additional actions that should take place directly after the
+  configuring step and before the ``%make`` macro or equivalent. If
+  autospec is creating AVX2, AVX-512 or 32-bit, these actions will be
+  repeated for each of those builds, before their respective make
+  steps. This will be placed in the resulting ``.spec``, and is used
+  for situations where fine-grained control is required.
+
+install_prepend
+  Additional actions that should take place directly after
+  ``%install`` but before the ``%make_install`` macro (or equivalent).
+  This will be placed in the resulting ``.spec``, and is used for
   situations where fine-grained control is required.
 
+install_append
+  Additional actions that should take place at the very end of the
+  ``%install`` section. This will be placed in the resulting ``.spec``,
+  and is used for situations where fine-grained control is required.
+
 install_macro
-  The contents of this file be used instead of the automatically detected
+  The contents of this file will be used instead of the automatically detected
   ``install`` routine, i.e. use this if ``%make_install`` is insufficient.
 
 subdir
@@ -262,8 +299,9 @@ subdir
   directories for each step in the build.
 
 cmake_srcdir
- The contents of this file are a path the source directory in which to run cmake
- for non-standard packages.
+ The contents of this file are a path to the source directory in which to run
+ cmake for non-standard packages. This path is relative to the clr-build
+ subdirectory, which is created directly below the source package's root.
 
 build_pattern
   In certain situations, the automatically detected build pattern may not work
@@ -275,19 +313,31 @@ build_pattern
   * ruby: ruby language package
   * maven: Java language package
   * configure: Traditional ``%configure`` autotools route
-  * configure_ac: Like ``configure, but performs ``%reconfigure`` to regenerate
-    ``./configure``
+  * configure_ac: Like ``configure``, but performs ``%reconfigure`` to
+    regenerate ``./configure``
   * autogen: Similar to ``configure_ac`` but uses the existing ``./autogen.sh``
     instead of ``%reconfigure``
   * cmake: Traditional builds using CMake
   * qmake: qmake (Qt5) projects
+  * make: Run ``make`` followed by ``make install``, skipping configure. Note
+    that this is the fallback build pattern in case no other build patterns are
+    autodetected
   * distutils: Only build the Pythonic package with Python 2
   * distutils3: Only build the Pythonic package with Python 3
   * distutils23: Build the Pythonic package using both Python 2 and Python 3
+  * meson: Build package with Meson/Ninja
+  * \[WIP\] cargo: Build Rust package with Cargo
+  * \[WIP\] golang: Build Go package
+  * \[WIP\] scons: Build package with Scons
 
 series
   This file contains a list of patches to apply during the build, using the
   ``%patch`` macro. As such it is affected by ``-p1`` style modifiers.
+  Arguments to patch can be added after the patch filename.  For example:
+  
+  ```
+  0001-my-awesome-patch.patch -d some/subdir -p1
+  ```
 
 golang_libpath
   When building go packages, the go import path will be guessed automatically
@@ -310,6 +360,34 @@ extras
   you wish to be placed into an automatic ``-extras`` subpackage. This allows
   one to keep the main package slim and split out optional functionality or
   files.
+
+dev_extras
+  Same as "extras" above, but instead of the files being placed in an
+  ``-extras`` subpackage, they will be placed in the ``-dev`` one. Use this
+  functionality to place files used only for development against this
+  software that Autospec does not automatically detect.
+
+${custom}_extras
+  A `toml <https://github.com/toml-lang/toml>`_ file with a required 'files'
+  keypair that has as its value a list of strings that are full paths that
+  will be put in the ``${custom}-extras`` subpackage. It can also contain an
+  optional 'requires' keypair that has as its value a list of strings that
+  are subpackage names of other subpackages in the package. For example a
+  foo_extras file containing::
+
+    files = ['/usr/bin/foo', '/usr/lib64/libfoo.so']
+    requires = ['data']
+
+  will produce a spec file package section for example-foo-extras with the
+  following content::
+
+    %package foo-extras
+    Summary: foo-extras components for the example package.
+    Group: Default
+    Requires: example-data = %{version}-%{release}
+
+    %description foo-extras
+    foo-extras components for the example package.
 
 setuid
   Each line in this file should contain the full path to a binary in the
@@ -479,3 +557,12 @@ URL. The implementation should show the now-stored license file via a
 web page, and enable a human to make a decision on the license. This is
 then stored internally, allowing future requests to automatically know
 the license type when this hash is encountered again.
+
+
+Integration of systemd unit files
+=================================
+``autospec`` can add most systemd template file types by having a file in the
+filename.extension in the build directory. Supported extensions are:
+``mount, service, socket, target, timer, path and tmpfiles``. The files will
+be added as Source# entries and be installed to their appropriate system
+location.
